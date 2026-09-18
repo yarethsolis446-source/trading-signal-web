@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -23,20 +22,15 @@ class TradingSignalApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Trading Signal Bot',
       debugShowCheckedModeBanner: false,
+      title: 'Trading Signal Bot',
       theme: ThemeData(
-        brightness: Brightness.dark,
         useMaterial3: true,
-        scaffoldBackgroundColor: const Color(0xFF080B12),
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF090D14),
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF00D4FF),
+          seedColor: const Color(0xFF00C896),
           brightness: Brightness.dark,
-        ),
-        cardTheme: const CardThemeData(
-          color: Color(0xFF10151F),
-          elevation: 0,
-          margin: EdgeInsets.zero,
         ),
       ),
       home: const HomePage(),
@@ -45,10 +39,12 @@ class TradingSignalApp extends StatelessWidget {
 }
 
 // ============================================================
-// CONFIGURACIÓN
+// CONSTANTES
 // ============================================================
 
-const String biquoteBase = 'https://biquote.io/api';
+const String biquoteBaseUrl = 'https://biquote.io/api';
+
+const int entryWindowSeconds = 15;
 
 const List<String> supportedPairs = [
   'EUR/USD',
@@ -83,30 +79,52 @@ const List<String> supportedPairs = [
 
 const List<String> supportedTimeframes = ['1m', '5m', '15m', '30m', '1h'];
 
-// Tiempo de oportunidad de entrada.
-// Se inicia cuando aparece una señal nueva.
-const int entryWindowSeconds = 15;
-
 // ============================================================
-// HELPERS
+// UTILIDADES
 // ============================================================
 
 double _avg(List<double> values) {
   if (values.isEmpty) return 0;
 
-  return values.reduce((a, b) => a + b) / values.length;
+  double total = 0;
+
+  for (final value in values) {
+    total += value;
+  }
+
+  return total / values.length;
 }
 
 double _highest(List<double> values) {
   if (values.isEmpty) return 0;
 
-  return values.reduce(math.max);
+  double result = values.first;
+
+  for (final value in values.skip(1)) {
+    result = math.max(result, value).toDouble();
+  }
+
+  return result;
 }
 
 double _lowest(List<double> values) {
   if (values.isEmpty) return 0;
 
-  return values.reduce(math.min);
+  double result = values.first;
+
+  for (final value in values.skip(1)) {
+    result = math.min(result, value).toDouble();
+  }
+
+  return result;
+}
+
+double _toDouble(dynamic value) {
+  if (value is num) {
+    return value.toDouble();
+  }
+
+  return double.tryParse(value?.toString() ?? '') ?? 0;
 }
 
 String normalizeSymbol(String symbol) {
@@ -130,32 +148,216 @@ int timeframeSeconds(String timeframe) {
   }
 }
 
-String formatPrice(double price, String pair) {
-  if (pair.contains('JPY')) {
+String formatPrice(double price) {
+  if (price >= 100) {
     return price.toStringAsFixed(3);
+  }
+
+  if (price >= 10) {
+    return price.toStringAsFixed(4);
   }
 
   return price.toStringAsFixed(5);
 }
 
-double _toDouble(dynamic value) {
-  if (value is num) {
-    return value.toDouble();
-  }
-
-  return double.tryParse(value?.toString() ?? '') ?? 0;
-}
-
-int _toInt(dynamic value) {
-  if (value is num) {
-    return value.toInt();
-  }
-
-  return int.tryParse(value?.toString() ?? '') ?? 0;
+String formatTime(DateTime dateTime) {
+  return DateFormat('HH:mm:ss').format(dateTime.toLocal());
 }
 
 // ============================================================
-// CANDLE
+// CONFIGURACIÓN POR TEMPORALIDAD
+// ============================================================
+
+class TimeframeConfig {
+  final String timeframe;
+
+  final int candlesToRequest;
+  final int analysisCandles;
+  final int supportResistanceLookback;
+  final int structureLookback;
+  final int bosLookback;
+
+  final int emaFast;
+  final int emaSlow;
+
+  final int atrPeriod;
+  final int momentumPeriod;
+
+  final double normalThreshold;
+  final double highVolThreshold;
+  final double lowVolThreshold;
+
+  final double minimumDifference;
+
+  final double dojiBodyRatio;
+  final double overextensionAtr;
+  final double breakoutAtrTolerance;
+  final double retestAtrTolerance;
+
+  final int cooldownSeconds;
+
+  const TimeframeConfig({
+    required this.timeframe,
+    required this.candlesToRequest,
+    required this.analysisCandles,
+    required this.supportResistanceLookback,
+    required this.structureLookback,
+    required this.bosLookback,
+    required this.emaFast,
+    required this.emaSlow,
+    required this.atrPeriod,
+    required this.momentumPeriod,
+    required this.normalThreshold,
+    required this.highVolThreshold,
+    required this.lowVolThreshold,
+    required this.minimumDifference,
+    required this.dojiBodyRatio,
+    required this.overextensionAtr,
+    required this.breakoutAtrTolerance,
+    required this.retestAtrTolerance,
+    required this.cooldownSeconds,
+  });
+
+  static TimeframeConfig forTimeframe(String timeframe) {
+    switch (timeframe) {
+      // --------------------------------------------------------
+      // 1 MINUTO
+      // --------------------------------------------------------
+      case '1m':
+        return const TimeframeConfig(
+          timeframe: '1m',
+          candlesToRequest: 220,
+          analysisCandles: 140,
+          supportResistanceLookback: 35,
+          structureLookback: 18,
+          bosLookback: 9,
+          emaFast: 7,
+          emaSlow: 18,
+          atrPeriod: 14,
+          momentumPeriod: 4,
+          normalThreshold: 25,
+          highVolThreshold: 29,
+          lowVolThreshold: 23,
+          minimumDifference: 4,
+          dojiBodyRatio: 0.16,
+          overextensionAtr: 2.20,
+          breakoutAtrTolerance: 0.18,
+          retestAtrTolerance: 0.28,
+          cooldownSeconds: 20,
+        );
+
+      // --------------------------------------------------------
+      // 5 MINUTOS
+      // --------------------------------------------------------
+      case '5m':
+        return const TimeframeConfig(
+          timeframe: '5m',
+          candlesToRequest: 220,
+          analysisCandles: 140,
+          supportResistanceLookback: 40,
+          structureLookback: 25,
+          bosLookback: 12,
+          emaFast: 9,
+          emaSlow: 21,
+          atrPeriod: 14,
+          momentumPeriod: 5,
+          normalThreshold: 28,
+          highVolThreshold: 32,
+          lowVolThreshold: 26,
+          minimumDifference: 5,
+          dojiBodyRatio: 0.18,
+          overextensionAtr: 2.25,
+          breakoutAtrTolerance: 0.15,
+          retestAtrTolerance: 0.25,
+          cooldownSeconds: 30,
+        );
+
+      // --------------------------------------------------------
+      // 15 MINUTOS
+      // --------------------------------------------------------
+      case '15m':
+        return const TimeframeConfig(
+          timeframe: '15m',
+          candlesToRequest: 240,
+          analysisCandles: 160,
+          supportResistanceLookback: 50,
+          structureLookback: 32,
+          bosLookback: 15,
+          emaFast: 10,
+          emaSlow: 24,
+          atrPeriod: 14,
+          momentumPeriod: 6,
+          normalThreshold: 31,
+          highVolThreshold: 35,
+          lowVolThreshold: 29,
+          minimumDifference: 6,
+          dojiBodyRatio: 0.20,
+          overextensionAtr: 2.40,
+          breakoutAtrTolerance: 0.13,
+          retestAtrTolerance: 0.23,
+          cooldownSeconds: 45,
+        );
+
+      // --------------------------------------------------------
+      // 30 MINUTOS
+      // --------------------------------------------------------
+      case '30m':
+        return const TimeframeConfig(
+          timeframe: '30m',
+          candlesToRequest: 260,
+          analysisCandles: 180,
+          supportResistanceLookback: 60,
+          structureLookback: 40,
+          bosLookback: 18,
+          emaFast: 12,
+          emaSlow: 26,
+          atrPeriod: 14,
+          momentumPeriod: 7,
+          normalThreshold: 34,
+          highVolThreshold: 38,
+          lowVolThreshold: 32,
+          minimumDifference: 7,
+          dojiBodyRatio: 0.22,
+          overextensionAtr: 2.55,
+          breakoutAtrTolerance: 0.12,
+          retestAtrTolerance: 0.22,
+          cooldownSeconds: 60,
+        );
+
+      // --------------------------------------------------------
+      // 1 HORA
+      // --------------------------------------------------------
+      case '1h':
+        return const TimeframeConfig(
+          timeframe: '1h',
+          candlesToRequest: 300,
+          analysisCandles: 200,
+          supportResistanceLookback: 70,
+          structureLookback: 50,
+          bosLookback: 22,
+          emaFast: 14,
+          emaSlow: 30,
+          atrPeriod: 14,
+          momentumPeriod: 8,
+          normalThreshold: 37,
+          highVolThreshold: 41,
+          lowVolThreshold: 35,
+          minimumDifference: 8,
+          dojiBodyRatio: 0.24,
+          overextensionAtr: 2.70,
+          breakoutAtrTolerance: 0.11,
+          retestAtrTolerance: 0.20,
+          cooldownSeconds: 90,
+        );
+
+      default:
+        return TimeframeConfig.forTimeframe('5m');
+    }
+  }
+}
+
+// ============================================================
+// MODELOS
 // ============================================================
 
 class Candle {
@@ -165,8 +367,6 @@ class Candle {
   final double low;
   final double close;
   final double volume;
-  final double tickVolume;
-  final bool isOpen;
 
   const Candle({
     required this.time,
@@ -175,109 +375,75 @@ class Candle {
     required this.low,
     required this.close,
     this.volume = 0,
-    this.tickVolume = 0,
-    this.isOpen = false,
-  });
-}
-
-// ============================================================
-// TICK
-// ============================================================
-
-class LiveTick {
-  final String symbol;
-  final double bid;
-  final double ask;
-  final double mid;
-  final double spread;
-  final DateTime timestamp;
-  final String direction;
-  final String marketState;
-  final bool stale;
-  final int quoteAgeSeconds;
-
-  const LiveTick({
-    required this.symbol,
-    required this.bid,
-    required this.ask,
-    required this.mid,
-    required this.spread,
-    required this.timestamp,
-    required this.direction,
-    required this.marketState,
-    required this.stale,
-    required this.quoteAgeSeconds,
   });
 
-  factory LiveTick.fromJson(Map<String, dynamic> json) {
-    return LiveTick(
-      symbol: json['symbol']?.toString() ?? '',
-      bid: _toDouble(json['bid']),
-      ask: _toDouble(json['ask']),
-      mid: _toDouble(json['mid']),
-      spread: _toDouble(json['spread']),
-      timestamp:
-          DateTime.tryParse(json['timestamp']?.toString() ?? '')?.toLocal() ??
-          DateTime.now(),
-      direction: json['direction']?.toString() ?? 'FLAT',
-      marketState: json['marketState']?.toString() ?? 'unknown',
-      stale: json['stale'] == true,
-      quoteAgeSeconds: _toInt(json['quoteAgeSeconds']),
-    );
+  bool get bullish => close > open;
+
+  bool get bearish => close < open;
+
+  double get range => high - low;
+
+  double get body => (close - open).abs();
+
+  double get upperWick {
+    return high - math.max(open, close).toDouble();
+  }
+
+  double get lowerWick {
+    return math.min(open, close).toDouble() - low;
   }
 }
 
-// ============================================================
-// RESULTADO
-// ============================================================
+class LiveTick {
+  final double price;
+  final double bid;
+  final double ask;
+  final DateTime time;
+
+  const LiveTick({
+    required this.price,
+    this.bid = 0,
+    this.ask = 0,
+    required this.time,
+  });
+
+  double get spread {
+    if (bid <= 0 || ask <= 0) return 0;
+    return (ask - bid).abs();
+  }
+}
 
 class SignalResult {
   final String direction;
   final String arrow;
   final String strength;
-
   final int score;
   final int maxScore;
 
   final String setup;
-  final String reason;
+  final String trend;
+  final String rsi;
+  final String macd;
+  final String candle;
 
-  final double referencePrice;
+  final List<String> reasons;
+  final List<String> confirmations;
+  final List<String> filters;
+
   final double support;
   final double resistance;
-  final double atr;
 
   final double emaFast;
   final double emaSlow;
-
+  final double atr;
   final double momentum;
 
-  final bool structureBullish;
-  final bool structureBearish;
+  final bool nearSupport;
+  final bool nearResistance;
 
-  final bool bosBullish;
-  final bool bosBearish;
+  final double livePrice;
 
-  final bool chochBullish;
-  final bool chochBearish;
-
-  final bool breakoutBullish;
-  final bool breakoutBearish;
-
-  final bool retestBullish;
-  final bool retestBearish;
-
-  final bool rejectionBullish;
-  final bool rejectionBearish;
-
-  final bool engulfBullish;
-  final bool engulfBearish;
-
-  final bool momentumBullish;
-  final bool momentumBearish;
-
-  final List<String> confirmations;
-  final List<String> warnings;
+  final String timeframe;
 
   const SignalResult({
     required this.direction,
@@ -286,37 +452,28 @@ class SignalResult {
     required this.score,
     required this.maxScore,
     required this.setup,
-    required this.reason,
-    required this.referencePrice,
+    required this.trend,
+    required this.rsi,
+    required this.macd,
+    required this.candle,
+    required this.reasons,
+    required this.confirmations,
+    required this.filters,
     required this.support,
     required this.resistance,
-    required this.atr,
     required this.emaFast,
     required this.emaSlow,
+    required this.atr,
     required this.momentum,
-    required this.structureBullish,
-    required this.structureBearish,
-    required this.bosBullish,
-    required this.bosBearish,
-    required this.chochBullish,
-    required this.chochBearish,
-    required this.breakoutBullish,
-    required this.breakoutBearish,
-    required this.retestBullish,
-    required this.retestBearish,
-    required this.rejectionBullish,
-    required this.rejectionBearish,
-    required this.engulfBullish,
-    required this.engulfBearish,
-    required this.momentumBullish,
-    required this.momentumBearish,
-    required this.confirmations,
-    required this.warnings,
+    required this.nearSupport,
+    required this.nearResistance,
+    required this.livePrice,
+    required this.timeframe,
   });
 }
 
 // ============================================================
-// EMA
+// INDICADORES
 // ============================================================
 
 List<double> _ema(List<double> values, int period) {
@@ -325,78 +482,90 @@ List<double> _ema(List<double> values, int period) {
   final result = List<double>.filled(values.length, 0);
 
   if (values.length < period) {
-    result[0] = values[0];
+    double sum = 0;
 
-    final alpha = 2 / (period + 1);
-
-    for (int i = 1; i < values.length; i++) {
-      result[i] = values[i] * alpha + result[i - 1] * (1 - alpha);
+    for (int i = 0; i < values.length; i++) {
+      sum += values[i];
+      result[i] = sum / (i + 1);
     }
 
     return result;
   }
 
-  double seed = 0;
+  double sum = 0;
 
   for (int i = 0; i < period; i++) {
-    seed += values[i];
+    sum += values[i];
   }
 
-  seed /= period;
+  result[period - 1] = sum / period;
 
-  for (int i = 0; i < period; i++) {
-    result[i] = seed;
-  }
-
-  final alpha = 2 / (period + 1);
+  final multiplier = 2 / (period + 1);
 
   for (int i = period; i < values.length; i++) {
-    result[i] = values[i] * alpha + result[i - 1] * (1 - alpha);
+    result[i] = ((values[i] - result[i - 1]) * multiplier) + result[i - 1];
+  }
+
+  for (int i = 0; i < period - 1; i++) {
+    result[i] = values[i];
   }
 
   return result;
 }
 
-// ============================================================
-// ATR
-// ============================================================
+List<double> _atr(List<Candle> candles, int period) {
+  if (candles.isEmpty) return [];
 
-double _atr(List<Candle> candles, int period) {
-  if (candles.length < 2) return 0;
+  final tr = List<double>.filled(candles.length, 0);
 
-  final trs = <double>[];
+  for (int i = 0; i < candles.length; i++) {
+    if (i == 0) {
+      tr[i] = candles[i].high - candles[i].low;
+      continue;
+    }
 
-  for (int i = 1; i < candles.length; i++) {
     final current = candles[i];
-    final previous = candles[i - 1];
 
-    final tr1 = current.high - current.low;
-    final tr2 = (current.high - previous.close).abs();
-    final tr3 = (current.low - previous.close).abs();
+    final a = current.high - current.low;
 
-    trs.add(math.max(tr1, math.max(tr2, tr3)));
+    final b = (current.high - candles[i - 1].close).abs();
+
+    final c = (current.low - candles[i - 1].close).abs();
+
+    tr[i] = math.max(a, math.max(b, c)).toDouble();
   }
 
-  if (trs.isEmpty) return 0;
+  final result = List<double>.filled(candles.length, 0);
 
-  final count = math.min(period, trs.length);
+  double rolling = 0;
 
-  return _avg(trs.sublist(trs.length - count));
+  for (int i = 0; i < candles.length; i++) {
+    rolling += tr[i];
+
+    if (i >= period) {
+      rolling -= tr[i - period];
+    }
+
+    final count = math.min(i + 1, period).toInt();
+
+    result[i] = rolling / count;
+  }
+
+  return result;
 }
 
-// ============================================================
-// MOMENTUM
-// ============================================================
+List<double> _momentum(List<double> closes, int period) {
+  final result = List<double>.filled(closes.length, 0);
 
-double _momentum(List<double> closes, int period) {
-  if (closes.length <= period) return 0;
+  for (int i = 0; i < closes.length; i++) {
+    if (i < period) {
+      result[i] = 0;
+    } else {
+      result[i] = closes[i] - closes[i - period];
+    }
+  }
 
-  final previous = closes[closes.length - 1 - period];
-  final current = closes.last;
-
-  if (previous == 0) return 0;
-
-  return ((current - previous) / previous) * 100;
+  return result;
 }
 
 // ============================================================
@@ -407,1027 +576,984 @@ class BiquoteService {
   Future<List<Candle>> getCandles({
     required String symbol,
     required String timeframe,
-    int limit = 200,
+    required int limit,
   }) async {
     final normalized = normalizeSymbol(symbol);
 
     final uri = Uri.parse(
-      '$biquoteBase/$normalized/ohlc'
+      '$biquoteBaseUrl/$normalized/ohlc'
       '?interval=$timeframe'
       '&limit=$limit',
     );
 
     final response = await http
         .get(uri, headers: const {'Accept': 'application/json'})
-        .timeout(const Duration(seconds: 10));
+        .timeout(const Duration(seconds: 12));
 
     if (response.statusCode != 200) {
-      throw Exception('Biquote respondió ${response.statusCode}');
+      throw Exception('Biquote HTTP ${response.statusCode}');
     }
 
     final decoded = jsonDecode(response.body);
 
-    if (decoded is! Map<String, dynamic>) {
-      throw Exception('Respuesta inválida de Biquote');
+    dynamic rawBars;
+
+    if (decoded is Map<String, dynamic>) {
+      rawBars = decoded['bars'];
+
+      if (rawBars == null) {
+        rawBars = decoded['data'];
+      }
+
+      if (rawBars == null) {
+        rawBars = decoded['candles'];
+      }
+    } else if (decoded is List) {
+      rawBars = decoded;
     }
 
-    final bars = decoded['bars'];
-
-    if (bars is! List) {
-      throw Exception('Biquote no devolvió barras');
+    if (rawBars is! List) {
+      throw Exception('Biquote no devolvió velas.');
     }
 
     final candles = <Candle>[];
 
-    for (final item in bars) {
+    for (final item in rawBars) {
       if (item is! Map) continue;
 
-      final map = Map<String, dynamic>.from(item);
+      final isOpen = item['isOpen'];
 
-      if (map['isOpen'] == true) continue;
+      if (isOpen == true) {
+        continue;
+      }
 
-      final date = DateTime.tryParse(map['openTime']?.toString() ?? '');
-
-      if (date == null) continue;
-
-      final open = _toDouble(map['open']);
-      final high = _toDouble(map['high']);
-      final low = _toDouble(map['low']);
-      final close = _toDouble(map['close']);
+      final open = _toDouble(item['open']);
+      final high = _toDouble(item['high']);
+      final low = _toDouble(item['low']);
+      final close = _toDouble(item['close']);
 
       if (open <= 0 || high <= 0 || low <= 0 || close <= 0) {
         continue;
       }
 
+      dynamic rawTime =
+          item['openTime'] ?? item['time'] ?? item['timestamp'] ?? item['date'];
+
+      DateTime? time;
+
+      if (rawTime is num) {
+        final value = rawTime.toInt();
+
+        if (value > 100000000000) {
+          time = DateTime.fromMillisecondsSinceEpoch(value, isUtc: true);
+        } else {
+          time = DateTime.fromMillisecondsSinceEpoch(value * 1000, isUtc: true);
+        }
+      } else if (rawTime != null) {
+        time = DateTime.tryParse(rawTime.toString());
+      }
+
+      time ??= DateTime.now().toUtc();
+
       candles.add(
         Candle(
-          time: date.toLocal(),
+          time: time,
           open: open,
           high: high,
           low: low,
           close: close,
-          volume: _toDouble(map['volume']),
-          tickVolume: _toDouble(map['tickVolume']),
+          volume: _toDouble(item['volume'] ?? item['tickVolume']),
         ),
       );
     }
 
     candles.sort((a, b) => a.time.compareTo(b.time));
 
+    if (candles.length > limit) {
+      return candles.sublist(candles.length - limit);
+    }
+
     return candles;
   }
 
-  Future<LiveTick> getLatestTick(String symbol) async {
+  Future<LiveTick?> getLatestTick({required String symbol}) async {
     final normalized = normalizeSymbol(symbol);
 
-    final uri = Uri.parse('$biquoteBase/$normalized?allowStale=false');
+    final uri = Uri.parse('$biquoteBaseUrl/$normalized');
 
-    final response = await http
-        .get(uri, headers: const {'Accept': 'application/json'})
-        .timeout(const Duration(seconds: 5));
+    try {
+      final response = await http
+          .get(uri, headers: const {'Accept': 'application/json'})
+          .timeout(const Duration(seconds: 7));
 
-    if (response.statusCode != 200) {
-      throw Exception('No hay tick disponible (${response.statusCode})');
+      if (response.statusCode != 200) {
+        return null;
+      }
+
+      final decoded = jsonDecode(response.body);
+
+      if (decoded is! Map) {
+        return null;
+      }
+
+      double price = _toDouble(
+        decoded['mid'] ??
+            decoded['price'] ??
+            decoded['last'] ??
+            decoded['close'],
+      );
+
+      final bid = _toDouble(decoded['bid']);
+
+      final ask = _toDouble(decoded['ask']);
+
+      if (price <= 0 && bid > 0 && ask > 0) {
+        price = (bid + ask) / 2;
+      }
+
+      if (price <= 0) {
+        return null;
+      }
+
+      dynamic rawTime =
+          decoded['time'] ?? decoded['timestamp'] ?? decoded['timestampMs'];
+
+      DateTime time = DateTime.now().toUtc();
+
+      if (rawTime is num) {
+        final value = rawTime.toInt();
+
+        if (value > 100000000000) {
+          time = DateTime.fromMillisecondsSinceEpoch(value, isUtc: true);
+        } else {
+          time = DateTime.fromMillisecondsSinceEpoch(value * 1000, isUtc: true);
+        }
+      }
+
+      return LiveTick(price: price, bid: bid, ask: ask, time: time);
+    } catch (_) {
+      return null;
     }
-
-    final decoded = jsonDecode(response.body);
-
-    if (decoded is! Map<String, dynamic>) {
-      throw Exception('Tick inválido');
-    }
-
-    return LiveTick.fromJson(decoded);
   }
 }
 
 // ============================================================
-// BIQUOTE REALTIME
+// REALTIME
 // ============================================================
 
 class BiquoteRealtime {
   WebSocketChannel? _channel;
+
   StreamSubscription? _subscription;
 
-  bool connected = false;
+  final StreamController<LiveTick> _controller =
+      StreamController<LiveTick>.broadcast();
 
-  String? _symbol;
+  Stream<LiveTick> get stream => _controller.stream;
 
-  int _invocationId = 0;
+  bool get isConnected => _channel != null;
 
-  void Function(LiveTick tick)? onTick;
-  void Function(bool online)? onConnectionChanged;
-  void Function(String error)? onError;
-
-  Future<void> connect(String symbol) async {
+  Future<void> connect({required String symbol}) async {
     await disconnect();
 
-    _symbol = normalizeSymbol(symbol);
-
     try {
-      final uri = Uri.parse('wss://biquote.io/hubs/tick');
-
-      final channel = WebSocketChannel.connect(uri);
+      final channel = WebSocketChannel.connect(
+        Uri.parse('wss://biquote.io/hubs/tick'),
+      );
 
       _channel = channel;
 
-      await channel.ready;
-
       _subscription = channel.stream.listen(
-        _handleMessage,
-        onError: (Object error) {
-          connected = false;
-          onConnectionChanged?.call(false);
-          onError?.call(error.toString());
+        (message) {
+          _parseMessage(message);
+        },
+        onError: (_) {
+          _channel = null;
         },
         onDone: () {
-          connected = false;
-          onConnectionChanged?.call(false);
+          _channel = null;
         },
         cancelOnError: false,
       );
 
-      _sendHandshake();
+      final handshake = jsonEncode({'protocol': 'json', 'version': 1});
 
-      await Future.delayed(const Duration(milliseconds: 500));
+      channel.sink.add('$handshake\u001e');
 
-      await _subscribe();
-
-      connected = true;
-      onConnectionChanged?.call(true);
-    } catch (e) {
-      connected = false;
-      onConnectionChanged?.call(false);
-      onError?.call(e.toString());
-    }
-  }
-
-  void _sendHandshake() {
-    _sendRaw(jsonEncode({'protocol': 'json', 'version': 1}));
-  }
-
-  Future<void> _subscribe() async {
-    final symbol = _symbol;
-
-    if (symbol == null) return;
-
-    _invocationId++;
-
-    _sendRaw(
-      jsonEncode({
+      final invocation = jsonEncode({
         'type': 1,
-        'invocationId': _invocationId.toString(),
         'target': 'Subscribe',
-        'arguments': [
-          [symbol],
-        ],
-      }),
-    );
-  }
+        'arguments': [normalizeSymbol(symbol)],
+      });
 
-  void _sendRaw(String message) {
-    final channel = _channel;
-
-    if (channel == null) return;
-
-    channel.sink.add('$message\u001e');
-  }
-
-  void _handleMessage(dynamic data) {
-    try {
-      String text;
-
-      if (data is String) {
-        text = data;
-      } else if (data is Uint8List) {
-        text = utf8.decode(data);
-      } else {
-        text = data.toString();
-      }
-
-      final messages = text.split('\u001e');
-
-      for (final raw in messages) {
-        if (raw.trim().isEmpty) continue;
-
-        final decoded = jsonDecode(raw);
-
-        if (decoded is! Map) continue;
-
-        if (decoded['type'] == 1 && decoded['target'] == 'ReceiveTick') {
-          final args = decoded['arguments'];
-
-          if (args is List && args.isNotEmpty) {
-            final tickData = args.first;
-
-            if (tickData is Map) {
-              final tick = LiveTick.fromJson(
-                Map<String, dynamic>.from(tickData),
-              );
-
-              onTick?.call(tick);
-            }
-          }
-        }
-      }
-    } catch (e) {
-      onError?.call('Error procesando tick: $e');
+      channel.sink.add('$invocation\u001e');
+    } catch (_) {
+      _channel = null;
     }
+  }
+
+  void _parseMessage(dynamic message) {
+    try {
+      String raw = message.toString();
+
+      raw = raw.replaceAll('\u001e', '');
+
+      if (raw.isEmpty) return;
+
+      final decoded = jsonDecode(raw);
+
+      if (decoded is! Map) return;
+
+      final arguments = decoded['arguments'];
+
+      dynamic data = arguments;
+
+      if (arguments is List && arguments.isNotEmpty) {
+        data = arguments.first;
+      }
+
+      if (data is List && data.isNotEmpty) {
+        data = data.first;
+      }
+
+      if (data is! Map) return;
+
+      final price = _toDouble(
+        data['mid'] ?? data['price'] ?? data['last'] ?? data['close'],
+      );
+
+      final bid = _toDouble(data['bid']);
+
+      final ask = _toDouble(data['ask']);
+
+      if (price <= 0 && bid <= 0 && ask <= 0) {
+        return;
+      }
+
+      final finalPrice = price > 0
+          ? price
+          : (bid > 0 && ask > 0)
+          ? (bid + ask) / 2
+          : bid > 0
+          ? bid
+          : ask;
+
+      if (finalPrice <= 0) return;
+
+      _controller.add(
+        LiveTick(
+          price: finalPrice,
+          bid: bid,
+          ask: ask,
+          time: DateTime.now().toUtc(),
+        ),
+      );
+    } catch (_) {}
   }
 
   Future<void> disconnect() async {
-    connected = false;
-
-    await _subscription?.cancel();
-
-    _subscription = null;
+    try {
+      await _subscription?.cancel();
+    } catch (_) {}
 
     try {
       await _channel?.sink.close();
     } catch (_) {}
 
+    _subscription = null;
     _channel = null;
+  }
 
-    onConnectionChanged?.call(false);
+  Future<void> dispose() async {
+    await disconnect();
+    await _controller.close();
   }
 }
 
 // ============================================================
-// PRICE ACTION ENGINE
+// PRICE ACTION ENGINE MULTI-TIMEFRAME
 // ============================================================
 
 class PriceActionEngine {
   SignalResult analyze({
     required List<Candle> candles,
-    required double livePrice,
+    required String timeframe,
+    LiveTick? liveTick,
   }) {
-    if (candles.length < 40) {
-      return _waitResult(
-        candles.isNotEmpty ? candles.last.close : livePrice,
-        'No hay suficientes velas.',
+    final config = TimeframeConfig.forTimeframe(timeframe);
+
+    if (candles.length < 30) {
+      return SignalResult(
+        direction: 'WAIT',
+        arrow: '⏸',
+        strength: 'WEAK',
+        score: 0,
+        maxScore: 130,
+        setup: 'INSUFFICIENT DATA',
+        trend: 'NEUTRAL',
+        rsi: 'N/A',
+        macd: 'N/A',
+        candle: 'N/A',
+        reasons: const ['Se necesitan al menos 30 velas cerradas.'],
+        confirmations: const [],
+        filters: const [],
+        support: 0,
+        resistance: 0,
+        emaFast: 0,
+        emaSlow: 0,
+        atr: 0,
+        momentum: 0,
+        nearSupport: false,
+        nearResistance: false,
+        livePrice: liveTick?.price ?? 0,
+        timeframe: timeframe,
       );
     }
 
-    final data = candles.length > 100
-        ? candles.sublist(candles.length - 100)
-        : List<Candle>.from(candles);
+    final selected = candles.length > config.analysisCandles
+        ? candles.sublist(candles.length - config.analysisCandles)
+        : candles;
 
-    final closes = data.map((e) => e.close).toList();
+    final closes = selected.map((c) => c.close).toList();
 
-    final emaFastList = _ema(closes, 9);
-    final emaSlowList = _ema(closes, 21);
+    final emaFastList = _ema(closes, config.emaFast);
 
-    final emaFast = emaFastList.last;
-    final emaSlow = emaSlowList.last;
+    final emaSlowList = _ema(closes, config.emaSlow);
 
-    final atr = _atr(data, 14);
+    final atrList = _atr(selected, config.atrPeriod);
 
-    final support = _findSupport(data);
-    final resistance = _findResistance(data);
+    final momentumList = _momentum(closes, config.momentumPeriod);
 
-    final structure = _detectStructure(data);
+    final lastIndex = selected.length - 1;
 
-    final bosBullish = _bullishBos(data);
-    final bosBearish = _bearishBos(data);
+    final current = selected[lastIndex];
 
-    final chochBullish = _bullishChoch(data);
-    final chochBearish = _bearishChoch(data);
+    final emaFast = emaFastList[lastIndex];
 
-    final breakoutBullish = _bullishBreakout(data, resistance);
+    final emaSlow = emaSlowList[lastIndex];
 
-    final breakoutBearish = _bearishBreakout(data, support);
+    final atr = atrList[lastIndex];
 
-    final retestBullish = _bullishRetest(data, resistance);
+    final momentum = momentumList[lastIndex];
 
-    final retestBearish = _bearishRetest(data, support);
+    final srStart = math
+        .max(0, selected.length - config.supportResistanceLookback)
+        .toInt();
 
-    final rejectionBullish = _bullishRejection(data.last);
+    final srCandles = selected.sublist(srStart);
 
-    final rejectionBearish = _bearishRejection(data.last);
+    final support = _lowest(srCandles.map((c) => c.low).toList());
 
-    final engulfBullish = _bullishEngulfing(data);
+    final resistance = _highest(srCandles.map((c) => c.high).toList());
 
-    final engulfBearish = _bearishEngulfing(data);
+    final structureStart = math
+        .max(0, selected.length - config.structureLookback)
+        .toInt();
 
-    final momentum = _momentum(closes, 5);
+    final structureCandles = selected.sublist(structureStart);
 
-    final momentumBullish = momentum > 0.008;
-    final momentumBearish = momentum < -0.008;
+    final previousStructureStart = math
+        .max(0, structureCandles.length - 12)
+        .toInt();
 
-    final body = (data.last.close - data.last.open).abs();
+    final previousStructure = structureCandles.sublist(previousStructureStart);
 
-    final range = data.last.high - data.last.low;
+    final recentHigh = _highest(previousStructure.map((c) => c.high).toList());
 
-    final bodyRatio = range <= 0 ? 0 : body / range;
+    final recentLow = _lowest(previousStructure.map((c) => c.low).toList());
 
-    final doji = bodyRatio < 0.16;
+    // ========================================================
+    // ESTRUCTURA
+    // ========================================================
 
-    final nearResistance =
-        atr > 0 && (resistance - livePrice).abs() <= atr * 0.30;
+    final highs = structureCandles.map((c) => c.high).toList();
 
-    final nearSupport = atr > 0 && (livePrice - support).abs() <= atr * 0.30;
+    final lows = structureCandles.map((c) => c.low).toList();
 
-    final bullishTrend = emaFast > emaSlow;
-    final bearishTrend = emaFast < emaSlow;
+    bool bullishStructure = false;
+
+    bool bearishStructure = false;
+
+    if (highs.length >= 8) {
+      final mid = highs.length ~/ 2;
+
+      final firstHigh = _highest(highs.sublist(0, mid));
+
+      final secondHigh = _highest(highs.sublist(mid));
+
+      final firstLow = _lowest(lows.sublist(0, mid));
+
+      final secondLow = _lowest(lows.sublist(mid));
+
+      bullishStructure = secondHigh > firstHigh && secondLow > firstLow;
+
+      bearishStructure = secondHigh < firstHigh && secondLow < firstLow;
+    }
+
+    // ========================================================
+    // BOS
+    // ========================================================
+
+    final bosStart = math.max(0, selected.length - config.bosLookback).toInt();
+
+    final bosCandles = selected.sublist(bosStart);
+
+    final bosPreviousCount = math.max(1, bosCandles.length - 3).toInt();
+
+    final bosPrevious = bosCandles.sublist(0, bosPreviousCount);
+
+    final bosHigh = _highest(bosPrevious.map((c) => c.high).toList());
+
+    final bosLow = _lowest(bosPrevious.map((c) => c.low).toList());
+
+    final bullishBos = current.close > bosHigh;
+
+    final bearishBos = current.close < bosLow;
+
+    // ========================================================
+    // CHoCH
+    // ========================================================
+
+    final chochBullish = bullishStructure && current.close > recentHigh;
+
+    final chochBearish = bearishStructure && current.close < recentLow;
+
+    // ========================================================
+    // BREAKOUT
+    // ========================================================
+
+    final breakoutTolerance = atr * config.breakoutAtrTolerance;
+
+    final bullishBreakout =
+        current.close >= resistance - breakoutTolerance &&
+        current.close > current.open;
+
+    final bearishBreakout =
+        current.close <= support + breakoutTolerance &&
+        current.close < current.open;
+
+    // ========================================================
+    // RETEST
+    // ========================================================
+
+    bool bullishRetest = false;
+
+    bool bearishRetest = false;
+
+    if (selected.length >= 4) {
+      final previous = selected[lastIndex - 1];
+
+      bullishRetest =
+          previous.low <= resistance + (atr * config.retestAtrTolerance) &&
+          current.close > resistance &&
+          current.close > current.open;
+
+      bearishRetest =
+          previous.high >= support - (atr * config.retestAtrTolerance) &&
+          current.close < support &&
+          current.close < current.open;
+    }
+
+    // ========================================================
+    // REJECTION
+    // ========================================================
+
+    final bullishRejection =
+        current.lowerWick > current.body * 1.25 && current.close > current.open;
+
+    final bearishRejection =
+        current.upperWick > current.body * 1.25 && current.close < current.open;
+
+    // ========================================================
+    // ENGULFING
+    // ========================================================
+
+    bool bullishEngulfing = false;
+
+    bool bearishEngulfing = false;
+
+    if (selected.length >= 2) {
+      final previous = selected[lastIndex - 1];
+
+      bullishEngulfing =
+          previous.bearish &&
+          current.bullish &&
+          current.open <= previous.close &&
+          current.close >= previous.open;
+
+      bearishEngulfing =
+          previous.bullish &&
+          current.bearish &&
+          current.open >= previous.close &&
+          current.close <= previous.open;
+    }
+
+    // ========================================================
+    // MOMENTUM
+    // ========================================================
+
+    final bullishMomentum = momentum > atr * 0.12;
+
+    final bearishMomentum = momentum < -atr * 0.12;
+
+    // ========================================================
+    // EMA TREND
+    // ========================================================
+
+    final bullishTrend = emaFast > emaSlow && current.close >= emaFast;
+
+    final bearishTrend = emaFast < emaSlow && current.close <= emaFast;
+
+    // ========================================================
+    // LIVE PRICE
+    // ========================================================
+
+    bool liveBullish = false;
+
+    bool liveBearish = false;
+
+    if (liveTick != null && liveTick.price > 0) {
+      liveBullish = liveTick.price > current.close + (atr * 0.02);
+
+      liveBearish = liveTick.price < current.close - (atr * 0.02);
+    }
+
+    // ========================================================
+    // CANDLE QUALITY
+    // ========================================================
+
+    final candleRange = math.max(current.range, 0.00000001).toDouble();
+
+    final bodyRatio = current.body / candleRange;
+
+    final isDoji = bodyRatio < config.dojiBodyRatio;
+
+    final candleBullish = current.bullish && bodyRatio >= config.dojiBodyRatio;
+
+    final candleBearish = current.bearish && bodyRatio >= config.dojiBodyRatio;
+
+    // ========================================================
+    // OVEREXTENSION
+    // ========================================================
+
+    final distanceFromFast = (current.close - emaFast).abs();
+
+    final overextended =
+        atr > 0 && distanceFromFast > atr * config.overextensionAtr;
+
+    // ========================================================
+    // SUPPORT / RESISTANCE
+    // ========================================================
+
+    final srTolerance = math.max(atr * 0.25, current.close * 0.0005).toDouble();
+
+    final nearSupport = (current.close - support).abs() <= srTolerance;
+
+    final nearResistance = (resistance - current.close).abs() <= srTolerance;
+
+    // ========================================================
+    // VOLATILIDAD
+    // ========================================================
+
+    final recentAtrStart = math.max(0, atrList.length - 20).toInt();
+
+    final recentAtr = atrList.sublist(recentAtrStart);
+
+    final averageAtr = _avg(recentAtr);
+
+    double threshold;
+
+    if (atr > averageAtr * 1.35) {
+      threshold = config.highVolThreshold;
+    } else if (atr < averageAtr * 0.70) {
+      threshold = config.lowVolThreshold;
+    } else {
+      threshold = config.normalThreshold;
+    }
+
+    // ========================================================
+    // SCORE
+    // ========================================================
 
     int bullishScore = 0;
+
     int bearishScore = 0;
 
     final confirmations = <String>[];
-    final warnings = <String>[];
 
-    // ==========================================================
-    // ESTRUCTURA — PESO PRINCIPAL
-    // ==========================================================
+    final filters = <String>[];
 
-    if (structure == 'BULLISH') {
-      bullishScore += 18;
+    final reasons = <String>[];
+
+    // Structure
+    if (bullishStructure) {
+      bullishScore += 16;
       confirmations.add('Estructura HH/HL');
     }
 
-    if (structure == 'BEARISH') {
-      bearishScore += 18;
+    if (bearishStructure) {
+      bearishScore += 16;
       confirmations.add('Estructura LH/LL');
     }
 
-    // ==========================================================
-    // EMA — CONFIRMACIÓN, NO PROTAGONISTA
-    // ==========================================================
-
+    // EMA
     if (bullishTrend) {
-      bullishScore += 5;
-      confirmations.add('Contexto EMA alcista');
+      bullishScore += 6;
+      confirmations.add('EMA ${config.emaFast} > EMA ${config.emaSlow}');
     }
 
     if (bearishTrend) {
-      bearishScore += 5;
-      confirmations.add('Contexto EMA bajista');
+      bearishScore += 6;
+      confirmations.add('EMA ${config.emaFast} < EMA ${config.emaSlow}');
     }
 
-    // ==========================================================
     // BOS
-    // ==========================================================
-
-    if (bosBullish) {
-      bullishScore += 17;
+    if (bullishBos) {
+      bullishScore += 18;
       confirmations.add('BOS alcista');
     }
 
-    if (bosBearish) {
-      bearishScore += 17;
+    if (bearishBos) {
+      bearishScore += 18;
       confirmations.add('BOS bajista');
     }
 
-    // ==========================================================
-    // CHOCH
-    // ==========================================================
-
+    // CHoCH
     if (chochBullish) {
-      bullishScore += 13;
+      bullishScore += 14;
       confirmations.add('CHoCH alcista');
     }
 
     if (chochBearish) {
-      bearishScore += 13;
+      bearishScore += 14;
       confirmations.add('CHoCH bajista');
     }
 
-    // ==========================================================
-    // BREAKOUT
-    // ==========================================================
-
-    if (breakoutBullish) {
-      bullishScore += 13;
-      confirmations.add('Ruptura alcista');
-    }
-
-    if (breakoutBearish) {
-      bearishScore += 13;
-      confirmations.add('Ruptura bajista');
-    }
-
-    // ==========================================================
-    // RETEST
-    // ==========================================================
-
-    if (retestBullish) {
+    // Breakout
+    if (bullishBreakout) {
       bullishScore += 14;
+      confirmations.add('Breakout alcista');
+    }
+
+    if (bearishBreakout) {
+      bearishScore += 14;
+      confirmations.add('Breakout bajista');
+    }
+
+    // Retest
+    if (bullishRetest) {
+      bullishScore += 16;
       confirmations.add('Retest alcista');
     }
 
-    if (retestBearish) {
-      bearishScore += 14;
+    if (bearishRetest) {
+      bearishScore += 16;
       confirmations.add('Retest bajista');
     }
 
-    // ==========================================================
-    // RECHAZO
-    // ==========================================================
-
-    if (rejectionBullish) {
-      bullishScore += 11;
-      confirmations.add('Rechazo comprador');
+    // Rejection
+    if (bullishRejection) {
+      bullishScore += 10;
+      confirmations.add('Rechazo de mínimos');
     }
 
-    if (rejectionBearish) {
-      bearishScore += 11;
-      confirmations.add('Rechazo vendedor');
+    if (bearishRejection) {
+      bearishScore += 10;
+      confirmations.add('Rechazo de máximos');
     }
 
-    // ==========================================================
-    // ENGULFING
-    // ==========================================================
-
-    if (engulfBullish) {
-      bullishScore += 11;
+    // Engulfing
+    if (bullishEngulfing) {
+      bullishScore += 10;
       confirmations.add('Engulfing alcista');
     }
 
-    if (engulfBearish) {
-      bearishScore += 11;
+    if (bearishEngulfing) {
+      bearishScore += 10;
       confirmations.add('Engulfing bajista');
     }
 
-    // ==========================================================
-    // MOMENTUM
-    // ==========================================================
-
-    if (momentumBullish) {
+    // Momentum
+    if (bullishMomentum) {
       bullishScore += 8;
-      confirmations.add('Momentum positivo');
+      confirmations.add('Momentum alcista');
     }
 
-    if (momentumBearish) {
+    if (bearishMomentum) {
       bearishScore += 8;
-      confirmations.add('Momentum negativo');
+      confirmations.add('Momentum bajista');
     }
 
-    // ==========================================================
-    // PRECIO LIVE
-    // ==========================================================
-
-    if (livePrice > data.last.close) {
+    // Live price
+    if (liveBullish) {
       bullishScore += 5;
+      confirmations.add('Precio en vivo confirma ALZA');
     }
 
-    if (livePrice < data.last.close) {
+    if (liveBearish) {
       bearishScore += 5;
+      confirmations.add('Precio en vivo confirma BAJA');
     }
 
-    // ==========================================================
-    // DOJI
-    // ==========================================================
-
-    if (doji) {
-      bullishScore -= 4;
-      bearishScore -= 4;
-
-      warnings.add('Vela de indecisión');
+    // Candle
+    if (candleBullish) {
+      bullishScore += 4;
+      confirmations.add('Vela alcista válida');
     }
 
-    // ==========================================================
-    // SOPORTE / RESISTENCIA
-    // Ahora es advertencia moderada, no bloqueo fuerte.
-    // ==========================================================
-
-    if (nearResistance && bullishScore > bearishScore) {
-      bullishScore -= 6;
-
-      warnings.add('Cerca de resistencia');
+    if (candleBearish) {
+      bearishScore += 4;
+      confirmations.add('Vela bajista válida');
     }
 
-    if (nearSupport && bearishScore > bullishScore) {
-      bearishScore -= 6;
+    // ========================================================
+    // FILTROS
+    // ========================================================
 
-      warnings.add('Cerca de soporte');
+    if (isDoji) {
+      filters.add('Vela demasiado indecisa');
     }
 
-    // ==========================================================
-    // SOBREEXTENSIÓN
-    // ==========================================================
-
-    if (atr > 0) {
-      final distanceFromEma = (livePrice - emaFast).abs();
-
-      if (distanceFromEma > atr * 2.5) {
-        if (livePrice > emaFast) {
-          bullishScore -= 8;
-
-          warnings.add('Movimiento alcista extendido');
-        } else {
-          bearishScore -= 8;
-
-          warnings.add('Movimiento bajista extendido');
-        }
-      }
+    if (overextended) {
+      filters.add('Precio sobreextendido');
     }
 
-    bullishScore = math.max(0, bullishScore);
+    if (nearSupport) {
+      filters.add('Cerca de soporte');
+    }
 
-    bearishScore = math.max(0, bearishScore);
+    if (nearResistance) {
+      filters.add('Cerca de resistencia');
+    }
 
-    // ==========================================================
-    // PUNTUACIÓN
-    // ==========================================================
+    if (atr <= 0) {
+      filters.add('Volatilidad insuficiente');
+    }
 
-    const int maxScore = 139;
-
-    final finalScore = math.max(bullishScore, bearishScore);
+    // ========================================================
+    // CONFLICTO DIRECCIONAL
+    // ========================================================
 
     final difference = (bullishScore - bearishScore).abs();
 
-    // Antes: 42.
-    // Ahora: más frecuente.
-    int threshold = 30;
+    final contradictory =
+        bullishScore > 0 &&
+        bearishScore > 0 &&
+        difference < config.minimumDifference + 4;
 
-    // ==========================================================
-    // VOLATILIDAD ADAPTATIVA
-    // ==========================================================
-
-    if (atr > 0) {
-      final recentRanges = data
-          .sublist(math.max(0, data.length - 15))
-          .map((e) => e.high - e.low)
-          .toList();
-
-      final averageRange = _avg(recentRanges);
-
-      if (averageRange > 0) {
-        if (atr > averageRange * 1.45) {
-          threshold = 36;
-        }
-
-        if (atr < averageRange * 0.70) {
-          threshold = 27;
-        }
-      }
-    }
-
-    // ==========================================================
-    // DIFERENCIA DIRECCIONAL
-    // Más flexible que antes.
-    // ==========================================================
-
-    if (difference < 6) {
-      warnings.add('Direcciones muy equilibradas');
-    }
+    // ========================================================
+    // DIRECCIÓN
+    // ========================================================
 
     String direction = 'WAIT';
-    String arrow = '⏸';
 
-    String strength = 'WEAK';
-
-    String setup = 'Sin setup confirmado';
-
-    // ==========================================================
-    // SEÑAL ALCISTA
-    // ==========================================================
+    int score = math.max(bullishScore, bearishScore).toInt();
 
     if (bullishScore >= threshold &&
         bullishScore > bearishScore &&
-        difference >= 6) {
+        difference >= config.minimumDifference &&
+        !contradictory &&
+        !isDoji &&
+        !overextended &&
+        candleBullish) {
       direction = 'UP';
-      arrow = '↑';
-
-      if (retestBullish) {
-        setup = 'BREAKOUT + RETEST';
-      } else if (bosBullish) {
-        setup = 'BOS + PRICE ACTION';
-      } else if (chochBullish) {
-        setup = 'CHoCH + PRICE ACTION';
-      } else if (engulfBullish) {
-        setup = 'BULLISH ENGULFING';
-      } else if (rejectionBullish) {
-        setup = 'BULLISH REJECTION';
-      } else if (structure == 'BULLISH') {
-        setup = 'BULLISH STRUCTURE';
-      } else {
-        setup = 'BULLISH MOMENTUM';
-      }
-    }
-
-    // ==========================================================
-    // SEÑAL BAJISTA
-    // ==========================================================
-
-    if (bearishScore >= threshold &&
+    } else if (bearishScore >= threshold &&
         bearishScore > bullishScore &&
-        difference >= 6) {
+        difference >= config.minimumDifference &&
+        !contradictory &&
+        !isDoji &&
+        !overextended &&
+        candleBearish) {
       direction = 'DOWN';
-      arrow = '↓';
-
-      if (retestBearish) {
-        setup = 'BREAKOUT + RETEST';
-      } else if (bosBearish) {
-        setup = 'BOS + PRICE ACTION';
-      } else if (chochBearish) {
-        setup = 'CHoCH + PRICE ACTION';
-      } else if (engulfBearish) {
-        setup = 'BEARISH ENGULFING';
-      } else if (rejectionBearish) {
-        setup = 'BEARISH REJECTION';
-      } else if (structure == 'BEARISH') {
-        setup = 'BEARISH STRUCTURE';
-      } else {
-        setup = 'BEARISH MOMENTUM';
-      }
     }
 
-    // ==========================================================
-    // FUERZA
-    // ==========================================================
-
-    if (direction == 'WAIT') {
-      strength = finalScore >= threshold - 5 ? 'FILTERED' : 'WEAK';
-    } else if (finalScore >= 75) {
-      strength = 'STRONG';
-    } else if (finalScore >= 58) {
-      strength = 'GOOD';
-    } else if (finalScore >= threshold) {
-      strength = 'MODERATE';
-    } else {
-      strength = 'WEAK';
-    }
-
-    // ==========================================================
-    // RAZÓN
-    // ==========================================================
-
-    String reason;
+    // ========================================================
+    // RAZONES
+    // ========================================================
 
     if (direction == 'UP') {
-      reason = 'Predominio de acción de precio alcista con suficiente ventaja.';
+      reasons.add('La presión compradora supera a la vendedora.');
+
+      if (bullishStructure) {
+        reasons.add('La estructura favorece máximos y mínimos crecientes.');
+      }
+
+      if (bullishBos) {
+        reasons.add('Se detectó ruptura estructural alcista.');
+      }
+
+      if (bullishRetest) {
+        reasons.add('El precio confirmó un retest alcista.');
+      }
+
+      if (bullishMomentum) {
+        reasons.add('El momentum acompaña el movimiento.');
+      }
     } else if (direction == 'DOWN') {
-      reason = 'Predominio de acción de precio bajista con suficiente ventaja.';
+      reasons.add('La presión vendedora supera a la compradora.');
+
+      if (bearishStructure) {
+        reasons.add('La estructura favorece máximos y mínimos decrecientes.');
+      }
+
+      if (bearishBos) {
+        reasons.add('Se detectó ruptura estructural bajista.');
+      }
+
+      if (bearishRetest) {
+        reasons.add('El precio confirmó un retest bajista.');
+      }
+
+      if (bearishMomentum) {
+        reasons.add('El momentum acompaña el movimiento.');
+      }
     } else {
-      reason = 'La acción del precio todavía no tiene ventaja suficiente.';
+      if (isDoji) {
+        reasons.add('La vela actual tiene poca convicción.');
+      }
+
+      if (overextended) {
+        reasons.add('El precio está demasiado alejado de la EMA.');
+      }
+
+      if (contradictory) {
+        reasons.add(
+          'Las evidencias alcistas y bajistas están demasiado equilibradas.',
+        );
+      }
+
+      if (score < threshold) {
+        reasons.add(
+          'La puntuación no alcanza el umbral de ${threshold.toStringAsFixed(0)} para $timeframe.',
+        );
+      }
+
+      if (reasons.isEmpty) {
+        reasons.add('No existe suficiente confirmación direccional.');
+      }
+    }
+
+    // ========================================================
+    // SETUP
+    // ========================================================
+
+    final setupParts = <String>[];
+
+    if (bullishBos || bearishBos) {
+      setupParts.add('BOS');
+    }
+
+    if (bullishRetest || bearishRetest) {
+      setupParts.add('RETEST');
+    }
+
+    if (bullishBreakout || bearishBreakout) {
+      setupParts.add('BREAKOUT');
+    }
+
+    if (chochBullish || chochBearish) {
+      setupParts.add('CHoCH');
+    }
+
+    if (bullishEngulfing || bearishEngulfing) {
+      setupParts.add('ENGULFING');
+    }
+
+    if (bullishRejection || bearishRejection) {
+      setupParts.add('REJECTION');
+    }
+
+    if (setupParts.isEmpty && (bullishStructure || bearishStructure)) {
+      setupParts.add('STRUCTURE');
+    }
+
+    if (setupParts.isEmpty) {
+      setupParts.add('EARLY PRICE ACTION');
+    }
+
+    final setup = setupParts.join(' + ');
+
+    // ========================================================
+    // STRENGTH
+    // ========================================================
+
+    String strength;
+
+    if (direction == 'WAIT') {
+      strength = 'FILTERED';
+    } else if (score >= 75) {
+      strength = 'STRONG';
+    } else if (score >= 55) {
+      strength = 'GOOD';
+    } else if (score >= 40) {
+      strength = 'MODERATE';
+    } else {
+      strength = 'EARLY';
+    }
+
+    // ========================================================
+    // TEXTOS
+    // ========================================================
+
+    String trend;
+
+    if (bullishTrend) {
+      trend = 'ALCISTA';
+    } else if (bearishTrend) {
+      trend = 'BAJISTA';
+    } else {
+      trend = 'NEUTRAL';
+    }
+
+    String candleText;
+
+    if (candleBullish) {
+      candleText = 'ALCISTA';
+    } else if (candleBearish) {
+      candleText = 'BAJISTA';
+    } else {
+      candleText = 'INDECISA';
+    }
+
+    String momentumText;
+
+    if (bullishMomentum) {
+      momentumText = 'ALCISTA';
+    } else if (bearishMomentum) {
+      momentumText = 'BAJISTA';
+    } else {
+      momentumText = 'NEUTRO';
     }
 
     return SignalResult(
       direction: direction,
-      arrow: arrow,
+      arrow: direction == 'UP'
+          ? '↑'
+          : direction == 'DOWN'
+          ? '↓'
+          : '⏸',
       strength: strength,
-      score: finalScore,
-      maxScore: maxScore,
+      score: score,
+      maxScore: 130,
       setup: setup,
-      reason: reason,
-      referencePrice: livePrice,
+      trend: trend,
+      rsi: 'N/A',
+      macd: momentumText,
+      candle: candleText,
+      reasons: reasons,
+      confirmations: confirmations,
+      filters: filters,
       support: support,
       resistance: resistance,
-      atr: atr,
       emaFast: emaFast,
       emaSlow: emaSlow,
+      atr: atr,
       momentum: momentum,
-      structureBullish: structure == 'BULLISH',
-      structureBearish: structure == 'BEARISH',
-      bosBullish: bosBullish,
-      bosBearish: bosBearish,
-      chochBullish: chochBullish,
-      chochBearish: chochBearish,
-      breakoutBullish: breakoutBullish,
-      breakoutBearish: breakoutBearish,
-      retestBullish: retestBullish,
-      retestBearish: retestBearish,
-      rejectionBullish: rejectionBullish,
-      rejectionBearish: rejectionBearish,
-      engulfBullish: engulfBullish,
-      engulfBearish: engulfBearish,
-      momentumBullish: momentumBullish,
-      momentumBearish: momentumBearish,
-      confirmations: confirmations,
-      warnings: warnings,
+      nearSupport: nearSupport,
+      nearResistance: nearResistance,
+      livePrice: liveTick?.price ?? current.close,
+      timeframe: timeframe,
     );
-  }
-
-  SignalResult _waitResult(double price, String reason) {
-    return SignalResult(
-      direction: 'WAIT',
-      arrow: '⏸',
-      strength: 'FILTERED',
-      score: 0,
-      maxScore: 139,
-      setup: 'Esperando setup',
-      reason: reason,
-      referencePrice: price,
-      support: price,
-      resistance: price,
-      atr: 0,
-      emaFast: price,
-      emaSlow: price,
-      momentum: 0,
-      structureBullish: false,
-      structureBearish: false,
-      bosBullish: false,
-      bosBearish: false,
-      chochBullish: false,
-      chochBearish: false,
-      breakoutBullish: false,
-      breakoutBearish: false,
-      retestBullish: false,
-      retestBearish: false,
-      rejectionBullish: false,
-      rejectionBearish: false,
-      engulfBullish: false,
-      engulfBearish: false,
-      momentumBullish: false,
-      momentumBearish: false,
-      confirmations: const [],
-      warnings: const [],
-    );
-  }
-
-  // ==========================================================
-  // SUPPORT
-  // ==========================================================
-
-  double _findSupport(List<Candle> candles) {
-    final recent = candles.length > 40
-        ? candles.sublist(candles.length - 40)
-        : candles;
-
-    return _lowest(recent.map((e) => e.low).toList());
-  }
-
-  // ==========================================================
-  // RESISTANCE
-  // ==========================================================
-
-  double _findResistance(List<Candle> candles) {
-    final recent = candles.length > 40
-        ? candles.sublist(candles.length - 40)
-        : candles;
-
-    return _highest(recent.map((e) => e.high).toList());
-  }
-
-  // ==========================================================
-  // STRUCTURE
-  // ==========================================================
-
-  String _detectStructure(List<Candle> candles) {
-    if (candles.length < 15) {
-      return 'NEUTRAL';
-    }
-
-    final recent = candles.sublist(math.max(0, candles.length - 25));
-
-    final highs = <double>[];
-    final lows = <double>[];
-
-    for (int i = 2; i < recent.length - 2; i++) {
-      final candle = recent[i];
-
-      if (candle.high > recent[i - 1].high &&
-          candle.high > recent[i - 2].high &&
-          candle.high > recent[i + 1].high &&
-          candle.high > recent[i + 2].high) {
-        highs.add(candle.high);
-      }
-
-      if (candle.low < recent[i - 1].low &&
-          candle.low < recent[i - 2].low &&
-          candle.low < recent[i + 1].low &&
-          candle.low < recent[i + 2].low) {
-        lows.add(candle.low);
-      }
-    }
-
-    if (highs.length >= 2 && lows.length >= 2) {
-      final higherHigh = highs.last > highs[highs.length - 2];
-
-      final higherLow = lows.last > lows[lows.length - 2];
-
-      final lowerHigh = highs.last < highs[highs.length - 2];
-
-      final lowerLow = lows.last < lows[lows.length - 2];
-
-      if (higherHigh && higherLow) {
-        return 'BULLISH';
-      }
-
-      if (lowerHigh && lowerLow) {
-        return 'BEARISH';
-      }
-    }
-
-    return 'NEUTRAL';
-  }
-
-  // ============================================================
-  // BOS
-  // ============================================================
-
-  bool _bullishBos(List<Candle> candles) {
-    if (candles.length < 10) return false;
-
-    final current = candles.last;
-
-    final previous = candles.sublist(
-      math.max(0, candles.length - 12),
-      candles.length - 1,
-    );
-
-    final resistance = _highest(previous.map((e) => e.high).toList());
-
-    return current.close > resistance;
-  }
-
-  bool _bearishBos(List<Candle> candles) {
-    if (candles.length < 10) return false;
-
-    final current = candles.last;
-
-    final previous = candles.sublist(
-      math.max(0, candles.length - 12),
-      candles.length - 1,
-    );
-
-    final support = _lowest(previous.map((e) => e.low).toList());
-
-    return current.close < support;
-  }
-
-  // ============================================================
-  // CHOCH
-  // ============================================================
-
-  bool _bullishChoch(List<Candle> candles) {
-    if (candles.length < 20) return false;
-
-    final mid = candles.length - 8;
-
-    final earlier = candles.sublist(math.max(0, mid - 8), mid);
-
-    final later = candles.sublist(mid, candles.length - 1);
-
-    if (earlier.isEmpty || later.isEmpty) {
-      return false;
-    }
-
-    final earlierLow = _lowest(earlier.map((e) => e.low).toList());
-
-    final laterHigh = _highest(later.map((e) => e.high).toList());
-
-    final laterLow = _lowest(later.map((e) => e.low).toList());
-
-    final current = candles.last;
-
-    return laterLow < earlierLow && current.close > laterHigh;
-  }
-
-  bool _bearishChoch(List<Candle> candles) {
-    if (candles.length < 20) return false;
-
-    final mid = candles.length - 8;
-
-    final earlier = candles.sublist(math.max(0, mid - 8), mid);
-
-    final later = candles.sublist(mid, candles.length - 1);
-
-    if (earlier.isEmpty || later.isEmpty) {
-      return false;
-    }
-
-    final earlierHigh = _highest(earlier.map((e) => e.high).toList());
-
-    final laterHigh = _highest(later.map((e) => e.high).toList());
-
-    final laterLow = _lowest(later.map((e) => e.low).toList());
-
-    final current = candles.last;
-
-    return laterHigh > earlierHigh && current.close < laterLow;
-  }
-
-  // ============================================================
-  // BREAKOUT
-  // ============================================================
-
-  bool _bullishBreakout(List<Candle> candles, double resistance) {
-    if (candles.length < 3) return false;
-
-    final current = candles.last;
-    final previous = candles[candles.length - 2];
-
-    return previous.close <= resistance &&
-        current.close > resistance &&
-        current.close > current.open;
-  }
-
-  bool _bearishBreakout(List<Candle> candles, double support) {
-    if (candles.length < 3) return false;
-
-    final current = candles.last;
-    final previous = candles[candles.length - 2];
-
-    return previous.close >= support &&
-        current.close < support &&
-        current.close < current.open;
-  }
-
-  // ============================================================
-  // RETEST
-  // ============================================================
-
-  bool _bullishRetest(List<Candle> candles, double resistance) {
-    if (candles.length < 5) return false;
-
-    final current = candles.last;
-    final previous = candles[candles.length - 2];
-
-    final distance = (current.low - resistance).abs();
-
-    final atr = _atr(candles, 14);
-
-    if (atr <= 0) return false;
-
-    return previous.close > resistance &&
-        distance <= atr * 0.55 &&
-        current.close > resistance &&
-        current.close > current.open;
-  }
-
-  bool _bearishRetest(List<Candle> candles, double support) {
-    if (candles.length < 5) return false;
-
-    final current = candles.last;
-    final previous = candles[candles.length - 2];
-
-    final distance = (current.high - support).abs();
-
-    final atr = _atr(candles, 14);
-
-    if (atr <= 0) return false;
-
-    return previous.close < support &&
-        distance <= atr * 0.55 &&
-        current.close < support &&
-        current.close < current.open;
-  }
-
-  // ============================================================
-  // REJECTION
-  // ============================================================
-
-  bool _bullishRejection(Candle candle) {
-    final body = (candle.close - candle.open).abs();
-
-    final lowerWick = math.min(candle.open, candle.close) - candle.low;
-
-    final upperWick = candle.high - math.max(candle.open, candle.close);
-
-    if (body <= 0) {
-      return lowerWick > upperWick * 1.5;
-    }
-
-    return lowerWick >= body * 1.5 &&
-        lowerWick > upperWick &&
-        candle.close >= candle.open;
-  }
-
-  bool _bearishRejection(Candle candle) {
-    final body = (candle.close - candle.open).abs();
-
-    final lowerWick = math.min(candle.open, candle.close) - candle.low;
-
-    final upperWick = candle.high - math.max(candle.open, candle.close);
-
-    if (body <= 0) {
-      return upperWick > lowerWick * 1.5;
-    }
-
-    return upperWick >= body * 1.5 &&
-        upperWick > lowerWick &&
-        candle.close <= candle.open;
-  }
-
-  // ============================================================
-  // ENGULFING
-  // ============================================================
-
-  bool _bullishEngulfing(List<Candle> candles) {
-    if (candles.length < 2) return false;
-
-    final previous = candles[candles.length - 2];
-
-    final current = candles.last;
-
-    return previous.close < previous.open &&
-        current.close > current.open &&
-        current.open <= previous.close &&
-        current.close >= previous.open;
-  }
-
-  bool _bearishEngulfing(List<Candle> candles) {
-    if (candles.length < 2) return false;
-
-    final previous = candles[candles.length - 2];
-
-    final current = candles.last;
-
-    return previous.close > previous.open &&
-        current.close < current.open &&
-        current.open >= previous.close &&
-        current.close <= previous.open;
   }
 }
 
@@ -1445,81 +1571,160 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final BiquoteService _service = BiquoteService();
 
-  final PriceActionEngine _engine = PriceActionEngine();
-
   final BiquoteRealtime _realtime = BiquoteRealtime();
 
+  final PriceActionEngine _engine = PriceActionEngine();
+
   Timer? _refreshTimer;
+
   Timer? _countdownTimer;
 
-  String selectedPair = 'EUR/USD';
+  StreamSubscription? _tickSubscription;
+
+  String selectedPair = supportedPairs.first;
+
   String selectedTimeframe = '5m';
 
   List<Candle> candles = [];
 
-  SignalResult? signal;
   LiveTick? liveTick;
 
-  bool loading = true;
-  bool analyzingNow = false;
+  SignalResult? signal;
 
-  bool online = false;
-  bool realtimeOnline = false;
+  bool loading = false;
 
-  String errorMessage = '';
+  bool connected = false;
 
-  int secondsToNextCandle = 0;
+  String? error;
 
-  // ==========================================================
-  // TEMPORIZADOR DE ENTRADA
-  // ==========================================================
+  DateTime? _entryExpiresAt;
 
   int entrySecondsRemaining = 0;
 
-  bool entryTimerActive = false;
+  int secondsToNextCandle = 0;
 
-  String entrySignalDirection = '';
+  String? _lastSignalKey;
 
-  String? lastSignalKey;
-
-  double get currentPrice {
-    if (liveTick != null && liveTick!.mid > 0) {
-      return liveTick!.mid;
-    }
-
-    if (candles.isNotEmpty) {
-      return candles.last.close;
-    }
-
-    return 0;
-  }
-
-  // ==========================================================
-  // INIT
-  // ==========================================================
+  DateTime? _lastAnalysisTime;
 
   @override
   void initState() {
     super.initState();
 
-    _setupRealtime();
-
     _loadData();
 
-    _refreshTimer = Timer.periodic(
-      const Duration(seconds: 20),
-      (_) => _refreshCandles(),
-    );
+    _refreshTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+      _refreshCandles();
+    });
 
     _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _updateTimers();
+    });
+
+    _setupRealtime();
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+
+    _countdownTimer?.cancel();
+
+    _tickSubscription?.cancel();
+
+    _realtime.dispose();
+
+    super.dispose();
+  }
+
+  // ==========================================================
+  // CARGA
+  // ==========================================================
+
+  Future<void> _loadData() async {
+    setState(() {
+      loading = true;
+      error = null;
+    });
+
+    try {
+      final config = TimeframeConfig.forTimeframe(selectedTimeframe);
+
+      final result = await _service.getCandles(
+        symbol: selectedPair,
+        timeframe: selectedTimeframe,
+        limit: config.candlesToRequest,
+      );
+
+      if (!mounted) return;
+
+      if (result.length < 30) {
+        throw Exception(
+          'Biquote devolvió ${result.length} velas cerradas. Se necesitan al menos 30.',
+        );
+      }
+
+      setState(() {
+        candles = result;
+        loading = false;
+      });
+
+      await _setupRealtime();
+
+      await _analyzeNow();
+
+      await _loadLatestTick();
+    } catch (e) {
       if (!mounted) return;
 
       setState(() {
-        _updateCountdown();
-
-        _updateEntryTimer();
+        loading = false;
+        error = e.toString();
       });
-    });
+    }
+  }
+
+  Future<void> _refreshCandles() async {
+    if (loading) return;
+
+    try {
+      final config = TimeframeConfig.forTimeframe(selectedTimeframe);
+
+      final result = await _service.getCandles(
+        symbol: selectedPair,
+        timeframe: selectedTimeframe,
+        limit: config.candlesToRequest,
+      );
+
+      if (!mounted) return;
+
+      if (result.length < 30) {
+        return;
+      }
+
+      setState(() {
+        candles = result;
+      });
+
+      await _analyzeNow();
+
+      await _loadLatestTick();
+    } catch (_) {}
+  }
+
+  Future<void> _loadLatestTick() async {
+    final tick = await _service.getLatestTick(symbol: selectedPair);
+
+    if (!mounted) return;
+
+    if (tick != null) {
+      setState(() {
+        liveTick = tick;
+        connected = true;
+      });
+
+      _analyzeFromLiveTick();
+    }
   }
 
   // ==========================================================
@@ -1527,379 +1732,205 @@ class _HomePageState extends State<HomePage> {
   // ==========================================================
 
   Future<void> _setupRealtime() async {
-    _realtime.onConnectionChanged = (value) {
+    await _tickSubscription?.cancel();
+
+    _tickSubscription = _realtime.stream.listen((tick) {
       if (!mounted) return;
-
-      setState(() {
-        realtimeOnline = value;
-      });
-    };
-
-    _realtime.onTick = (tick) {
-      if (!mounted) return;
-
-      if (normalizeSymbol(selectedPair) != tick.symbol.toUpperCase()) {
-        return;
-      }
 
       setState(() {
         liveTick = tick;
-        online = true;
-
-        if (candles.isNotEmpty) {
-          signal = _engine.analyze(candles: candles, livePrice: tick.mid);
-        }
+        connected = true;
       });
-    };
 
-    _realtime.onError = (_) {};
+      _analyzeFromLiveTick();
+    });
 
-    await _realtime.connect(selectedPair);
+    await _realtime.connect(symbol: selectedPair);
+
+    final fallback = await _service.getLatestTick(symbol: selectedPair);
+
+    if (!mounted) return;
+
+    if (fallback != null) {
+      setState(() {
+        liveTick = fallback;
+        connected = true;
+      });
+
+      _analyzeFromLiveTick();
+    }
   }
 
   // ==========================================================
-  // ANALIZAR AHORA
+  // ANALISIS
   // ==========================================================
 
   Future<void> _analyzeNow() async {
-    if (analyzingNow) return;
+    if (candles.length < 30) return;
 
-    setState(() {
-      analyzingNow = true;
-      errorMessage = '';
-    });
+    final result = _engine.analyze(
+      candles: candles,
+      timeframe: selectedTimeframe,
+      liveTick: liveTick,
+    );
 
-    try {
-      final loadedCandles = await _service.getCandles(
-        symbol: selectedPair,
-        timeframe: selectedTimeframe,
-        limit: 200,
-      );
-
-      LiveTick? tick;
-
-      try {
-        tick = await _service.getLatestTick(selectedPair);
-      } catch (_) {
-        tick = liveTick;
-      }
-
-      if (loadedCandles.length < 30) {
-        throw Exception(
-          'Biquote devolvió '
-          '${loadedCandles.length} velas cerradas.',
-        );
-      }
-
-      final price =
-          tick?.mid ??
-          (loadedCandles.isNotEmpty ? loadedCandles.last.close : 0);
-
-      final result = _engine.analyze(candles: loadedCandles, livePrice: price);
-
-      if (!mounted) return;
-
-      setState(() {
-        candles = loadedCandles;
-
-        if (tick != null) {
-          liveTick = tick;
-        }
-
-        signal = result;
-
-        online = true;
-
-        analyzingNow = false;
-      });
-
-      _updateCountdown();
-
-      _handleSignal(result, forceEntryTimer: true);
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        analyzingNow = false;
-        errorMessage = e.toString();
-        online = false;
-      });
-    }
-  }
-
-  // ==========================================================
-  // LOAD
-  // ==========================================================
-
-  Future<void> _loadData() async {
     if (!mounted) return;
 
     setState(() {
-      loading = true;
-      errorMessage = '';
+      signal = result;
+      _lastAnalysisTime = DateTime.now();
     });
 
-    try {
-      final results = await Future.wait([
-        _service.getCandles(
-          symbol: selectedPair,
-          timeframe: selectedTimeframe,
-          limit: 200,
-        ),
-        _service.getLatestTick(selectedPair),
-      ]);
+    _handleSignal(result);
+  }
 
-      final loadedCandles = results[0] as List<Candle>;
+  void _analyzeFromLiveTick() {
+    if (candles.length < 30) return;
 
-      final tick = results[1] as LiveTick;
+    final result = _engine.analyze(
+      candles: candles,
+      timeframe: selectedTimeframe,
+      liveTick: liveTick,
+    );
 
-      if (loadedCandles.length < 30) {
-        throw Exception(
-          'Biquote devolvió '
-          '${loadedCandles.length} velas cerradas.',
-        );
-      }
+    if (!mounted) return;
 
-      final result = _engine.analyze(
-        candles: loadedCandles,
-        livePrice: tick.mid,
-      );
+    setState(() {
+      signal = result;
+    });
 
-      if (!mounted) return;
-
-      setState(() {
-        candles = loadedCandles;
-        liveTick = tick;
-        signal = result;
-
-        online = true;
-        loading = false;
-      });
-
-      _updateCountdown();
-
-      _handleSignal(result, forceEntryTimer: true);
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        loading = false;
-        online = false;
-        errorMessage = e.toString();
-      });
-    }
+    _handleSignal(result);
   }
 
   // ==========================================================
-  // REFRESH
+  // SEÑALES
   // ==========================================================
 
-  Future<void> _refreshCandles() async {
-    try {
-      final loadedCandles = await _service.getCandles(
-        symbol: selectedPair,
-        timeframe: selectedTimeframe,
-        limit: 200,
-      );
-
-      if (loadedCandles.isEmpty) return;
-
-      final result = _engine.analyze(
-        candles: loadedCandles,
-        livePrice: currentPrice,
-      );
-
-      if (!mounted) return;
-
-      setState(() {
-        candles = loadedCandles;
-        signal = result;
-        online = true;
-      });
-
-      _handleSignal(result);
-    } catch (_) {
-      if (!mounted) return;
-
-      setState(() {
-        online = false;
-      });
+  void _handleSignal(SignalResult result) {
+    if (result.direction == 'WAIT') {
+      return;
     }
-  }
 
-  // ==========================================================
-  // SIGNAL KEY + ENTRY TIMER
-  // ==========================================================
-
-  void _handleSignal(SignalResult result, {bool forceEntryTimer = false}) {
-    final candleTime = candles.isNotEmpty
+    final latestCandle = candles.isNotEmpty
         ? candles.last.time.millisecondsSinceEpoch
         : 0;
 
     final key =
-        '${selectedPair}_'
-        '${selectedTimeframe}_'
-        '${result.direction}_'
-        '${result.setup}_'
-        '$candleTime';
+        '${selectedPair}_${selectedTimeframe}_${latestCandle}_${result.direction}';
 
-    final isNewSignal = key != lastSignalKey;
-
-    if (isNewSignal) {
-      lastSignalKey = key;
+    if (_lastSignalKey == key) {
+      return;
     }
 
-    if (result.direction != 'WAIT' && (isNewSignal || forceEntryTimer)) {
-      _startEntryTimer(result.direction);
-    }
+    _lastSignalKey = key;
 
-    if (result.direction == 'WAIT' && forceEntryTimer) {
-      _stopEntryTimer();
-    }
+    _entryExpiresAt = DateTime.now().add(
+      const Duration(seconds: entryWindowSeconds),
+    );
+
+    entrySecondsRemaining = entryWindowSeconds;
   }
 
-  void _startEntryTimer(String direction) {
+  // ==========================================================
+  // TEMPORIZADORES
+  // ==========================================================
+
+  void _updateTimers() {
+    if (!mounted) return;
+
+    int entry = 0;
+
+    if (_entryExpiresAt != null) {
+      final difference = _entryExpiresAt!.difference(DateTime.now()).inSeconds;
+
+      entry = math.max(0, difference).toInt();
+
+      if (entry == 0) {
+        _entryExpiresAt = null;
+      }
+    }
+
+    int nextCandle = 0;
+
+    if (candles.isNotEmpty) {
+      final timeframe = timeframeSeconds(selectedTimeframe);
+
+      final last = candles.last.time.toLocal();
+
+      final next = last.add(Duration(seconds: timeframe));
+
+      nextCandle = math
+          .max(0, next.difference(DateTime.now()).inSeconds)
+          .toInt();
+
+      if (nextCandle > timeframe) {
+        nextCandle = timeframe;
+      }
+    }
+
     setState(() {
-      entrySecondsRemaining = entryWindowSeconds;
-
-      entryTimerActive = true;
-
-      entrySignalDirection = direction;
+      entrySecondsRemaining = entry;
+      secondsToNextCandle = nextCandle;
     });
   }
 
-  void _stopEntryTimer() {
-    entrySecondsRemaining = 0;
-    entryTimerActive = false;
-    entrySignalDirection = '';
-  }
-
-  void _updateEntryTimer() {
-    if (!entryTimerActive) return;
-
-    if (entrySecondsRemaining > 0) {
-      entrySecondsRemaining--;
-    }
-
-    if (entrySecondsRemaining <= 0) {
-      entryTimerActive = false;
-      entrySignalDirection = '';
-    }
-  }
-
   // ==========================================================
-  // COUNTDOWN VELA
+  // CAMBIAR PAR
   // ==========================================================
 
-  void _updateCountdown() {
-    if (candles.isEmpty) {
-      secondsToNextCandle = 0;
-      return;
-    }
-
-    final last = candles.last.time.toUtc();
-
-    final duration = timeframeSeconds(selectedTimeframe);
-
-    final nextTimestamp =
-        ((last.millisecondsSinceEpoch ~/ 1000) + duration) * 1000;
-
-    final remaining =
-        nextTimestamp - DateTime.now().toUtc().millisecondsSinceEpoch;
-
-    secondsToNextCandle = math.max(0, remaining ~/ 1000);
-  }
-
-  // ==========================================================
-  // DISPOSE
-  // ==========================================================
-
-  @override
-  void dispose() {
-    _refreshTimer?.cancel();
-    _countdownTimer?.cancel();
-
-    _realtime.disconnect();
-
-    super.dispose();
-  }
-
-  // ==========================================================
-  // PAIR
-  // ==========================================================
-
-  Future<void> _changePair(String? value) async {
-    if (value == null || value == selectedPair) {
-      return;
-    }
+  Future<void> _changePair(String value) async {
+    if (value == selectedPair) return;
 
     setState(() {
       selectedPair = value;
-
       candles = [];
-
       signal = null;
-
       liveTick = null;
-
-      online = false;
-
-      loading = true;
-
-      errorMessage = '';
-
-      lastSignalKey = null;
-
-      _stopEntryTimer();
+      connected = false;
+      error = null;
+      _lastSignalKey = null;
+      _entryExpiresAt = null;
+      entrySecondsRemaining = 0;
     });
-
-    await _realtime.connect(selectedPair);
 
     await _loadData();
   }
 
   // ==========================================================
-  // TIMEFRAME
+  // CAMBIAR TIMEFRAME
   // ==========================================================
 
-  Future<void> _changeTimeframe(String? value) async {
-    if (value == null || value == selectedTimeframe) {
-      return;
-    }
+  Future<void> _changeTimeframe(String value) async {
+    if (value == selectedTimeframe) return;
 
     setState(() {
       selectedTimeframe = value;
-
       candles = [];
-
       signal = null;
-
-      loading = true;
-
-      errorMessage = '';
-
-      lastSignalKey = null;
-
-      _stopEntryTimer();
+      liveTick = null;
+      connected = false;
+      error = null;
+      _lastSignalKey = null;
+      _entryExpiresAt = null;
+      entrySecondsRemaining = 0;
     });
 
     await _loadData();
   }
 
   // ==========================================================
-  // BUILD
+  // UI
   // ==========================================================
 
   @override
   Widget build(BuildContext context) {
-    final result = signal;
-
     return Scaffold(
       appBar: AppBar(
-        backgroundColor: const Color(0xFF080B12),
+        elevation: 0,
+        backgroundColor: Colors.transparent,
         title: const Row(
           children: [
-            Icon(Icons.candlestick_chart, color: Color(0xFF00D4FF)),
+            Icon(Icons.candlestick_chart, size: 27),
             SizedBox(width: 10),
             Text(
               'Trading Signal Bot',
@@ -1908,221 +1939,263 @@ class _HomePageState extends State<HomePage> {
           ],
         ),
         actions: [
-          IconButton(
-            onPressed: analyzingNow || loading ? null : _analyzeNow,
-            tooltip: 'Analizar ahora',
-            icon: const Icon(Icons.refresh),
+          Padding(
+            padding: const EdgeInsets.only(right: 14),
+            child: Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(20),
+                  color: connected
+                      ? const Color(0xFF00C896).withOpacity(.14)
+                      : Colors.red.withOpacity(.14),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 8,
+                      height: 8,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: connected ? const Color(0xFF00C896) : Colors.red,
+                      ),
+                    ),
+                    const SizedBox(width: 7),
+                    Text(
+                      connected ? 'ONLINE' : 'OFFLINE',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ),
         ],
       ),
-      body: RefreshIndicator(
-        onRefresh: _loadData,
-        child: ListView(
-          padding: const EdgeInsets.all(14),
-          children: [
-            _buildConnectionCard(),
+      body: SafeArea(
+        child: RefreshIndicator(
+          onRefresh: _loadData,
+          child: SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 30),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _buildConnectionCard(),
 
-            const SizedBox(height: 12),
+                const SizedBox(height: 14),
 
-            _buildSelectors(),
+                _buildSelectors(),
 
-            const SizedBox(height: 12),
+                const SizedBox(height: 14),
 
-            // ==================================================
-            // BOTÓN ANALIZAR AHORA
-            // ==================================================
-            _buildAnalyzeButton(),
+                _buildAnalyzeButton(),
 
-            const SizedBox(height: 12),
+                if (loading) ...[
+                  const SizedBox(height: 16),
+                  const LinearProgressIndicator(),
+                ],
 
-            if (errorMessage.isNotEmpty) _buildErrorCard(),
+                if (error != null) ...[
+                  const SizedBox(height: 16),
+                  _buildErrorCard(),
+                ],
 
-            if (loading)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 50),
-                child: Center(child: CircularProgressIndicator()),
-              )
-            else ...[
-              if (result != null) _buildSignalCard(result),
+                if (signal != null) ...[
+                  const SizedBox(height: 16),
+                  _buildSignalCard(),
 
-              const SizedBox(height: 12),
+                  const SizedBox(height: 12),
 
-              // =================================================
-              // TEMPORIZADOR DE ENTRADA
-              // =================================================
-              if (result != null) _buildEntryTimer(result),
+                  _buildEntryTimer(),
 
-              const SizedBox(height: 12),
+                  const SizedBox(height: 12),
 
-              _buildLivePriceCard(),
+                  _buildMarketInfo(),
 
-              const SizedBox(height: 12),
+                  const SizedBox(height: 12),
 
-              _buildCountdownCard(),
+                  _buildChart(),
 
-              const SizedBox(height: 12),
+                  const SizedBox(height: 12),
 
-              _buildChart(),
+                  _buildAnalysisCard(),
 
-              const SizedBox(height: 12),
+                  const SizedBox(height: 12),
 
-              if (result != null) _buildAnalysis(result),
+                  _buildSupportResistance(),
 
-              const SizedBox(height: 12),
+                  const SizedBox(height: 12),
 
-              if (result != null) _buildLevels(result),
+                  _buildConfirmations(),
+                ],
 
-              const SizedBox(height: 12),
+                const SizedBox(height: 20),
 
-              if (result != null) _buildConfirmations(result),
-
-              const SizedBox(height: 24),
-
-              _buildFooter(),
-            ],
-          ],
+                _buildFooter(),
+              ],
+            ),
+          ),
         ),
       ),
     );
   }
 
   // ==========================================================
-  // BOTÓN ANALIZAR
+  // CONNECTION CARD
+  // ==========================================================
+
+  Widget _buildConnectionCard() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(18),
+        gradient: LinearGradient(
+          colors: [const Color(0xFF101A25), const Color(0xFF0D131C)],
+        ),
+        border: Border.all(
+          color: connected
+              ? const Color(0xFF00C896).withOpacity(.25)
+              : Colors.white.withOpacity(.07),
+        ),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: connected
+                  ? const Color(0xFF00C896).withOpacity(.12)
+                  : Colors.red.withOpacity(.12),
+            ),
+            child: Icon(
+              connected ? Icons.wifi : Icons.wifi_off,
+              color: connected ? const Color(0xFF00C896) : Colors.red,
+            ),
+          ),
+          const SizedBox(width: 13),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  connected ? 'Conectado a Biquote' : 'Esperando conexión',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 15,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  connected
+                      ? 'Datos de mercado en tiempo real'
+                      : 'Intentando obtener datos...',
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(.55),
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ==========================================================
+  // SELECTORES
+  // ==========================================================
+
+  Widget _buildSelectors() {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF101720),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withOpacity(.06)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text(
+            'MERCADO',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1.2,
+              color: Colors.white54,
+            ),
+          ),
+          const SizedBox(height: 8),
+          DropdownButtonFormField<String>(
+            value: selectedPair,
+            decoration: const InputDecoration(
+              labelText: 'Par',
+              prefixIcon: Icon(Icons.currency_exchange),
+              border: OutlineInputBorder(),
+            ),
+            items: supportedPairs.map((pair) {
+              return DropdownMenuItem(value: pair, child: Text(pair));
+            }).toList(),
+            onChanged: (value) {
+              if (value != null) {
+                _changePair(value);
+              }
+            },
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            'TEMPORALIDAD',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1.2,
+              color: Colors.white54,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: supportedTimeframes.map((timeframe) {
+              final selected = timeframe == selectedTimeframe;
+
+              return ChoiceChip(
+                label: Text(timeframe.toUpperCase()),
+                selected: selected,
+                onSelected: (_) {
+                  _changeTimeframe(timeframe);
+                },
+              );
+            }).toList(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ==========================================================
+  // BUTTON
   // ==========================================================
 
   Widget _buildAnalyzeButton() {
     return SizedBox(
-      height: 54,
+      height: 52,
       child: FilledButton.icon(
-        onPressed: analyzingNow || loading ? null : _analyzeNow,
-        icon: analyzingNow
-            ? const SizedBox(
-                width: 20,
-                height: 20,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            : const Icon(Icons.analytics_outlined),
-        label: Text(
-          analyzingNow ? 'ANALIZANDO...' : 'ANALIZAR AHORA',
-          style: const TextStyle(
-            fontWeight: FontWeight.w900,
-            letterSpacing: 0.5,
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ==========================================================
-  // CONNECTION
-  // ==========================================================
-
-  Widget _buildConnectionCard() {
-    final Color statusColor = realtimeOnline
-        ? const Color(0xFF00E676)
-        : online
-        ? Colors.orange
-        : Colors.red;
-
-    final String title = realtimeOnline
-        ? 'ONLINE • TICKS EN TIEMPO REAL'
-        : online
-        ? 'ONLINE • REST'
-        : 'OFFLINE';
-
-    final String subtitle = realtimeOnline
-        ? 'Biquote SignalR conectado'
-        : online
-        ? 'Datos de Biquote disponibles'
-        : 'No se pudo conectar';
-
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Row(
-          children: [
-            Container(
-              width: 12,
-              height: 12,
-              decoration: BoxDecoration(
-                color: statusColor,
-                shape: BoxShape.circle,
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      color: statusColor,
-                    ),
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    subtitle,
-                    style: const TextStyle(color: Colors.white54, fontSize: 12),
-                  ),
-                ],
-              ),
-            ),
-            if (realtimeOnline)
-              const Icon(Icons.wifi, color: Color(0xFF00E676)),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // ==========================================================
-  // SELECTORS
-  // ==========================================================
-
-  Widget _buildSelectors() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Row(
-          children: [
-            Expanded(
-              child: DropdownButtonFormField<String>(
-                initialValue: selectedPair,
-                decoration: const InputDecoration(
-                  labelText: 'Par',
-                  border: OutlineInputBorder(),
-                ),
-                items: supportedPairs
-                    .map(
-                      (pair) =>
-                          DropdownMenuItem(value: pair, child: Text(pair)),
-                    )
-                    .toList(),
-                onChanged: _changePair,
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: DropdownButtonFormField<String>(
-                initialValue: selectedTimeframe,
-                decoration: const InputDecoration(
-                  labelText: 'Temporalidad',
-                  border: OutlineInputBorder(),
-                ),
-                items: supportedTimeframes
-                    .map(
-                      (timeframe) => DropdownMenuItem(
-                        value: timeframe,
-                        child: Text(timeframe),
-                      ),
-                    )
-                    .toList(),
-                onChanged: _changeTimeframe,
-              ),
-            ),
-          ],
+        onPressed: loading ? null : _loadData,
+        icon: const Icon(Icons.analytics_outlined),
+        label: const Text(
+          'ANALIZAR AHORA',
+          style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: .4),
         ),
       ),
     );
@@ -2133,22 +2206,22 @@ class _HomePageState extends State<HomePage> {
   // ==========================================================
 
   Widget _buildErrorCard() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Icon(Icons.warning_amber_rounded, color: Colors.orange),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                errorMessage.replaceFirst('Exception: ', ''),
-                style: const TextStyle(color: Colors.orange),
-              ),
-            ),
-          ],
-        ),
+    return Container(
+      padding: const EdgeInsets.all(15),
+      decoration: BoxDecoration(
+        color: Colors.red.withOpacity(.08),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.red.withOpacity(.22)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.error_outline, color: Colors.red),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(error!, style: const TextStyle(color: Colors.white70)),
+          ),
+        ],
       ),
     );
   }
@@ -2157,319 +2230,312 @@ class _HomePageState extends State<HomePage> {
   // SIGNAL CARD
   // ==========================================================
 
-  Widget _buildSignalCard(SignalResult result) {
-    final isUp = result.direction == 'UP';
+  Widget _buildSignalCard() {
+    final currentSignal = signal!;
 
-    final isDown = result.direction == 'DOWN';
+    final isUp = currentSignal.direction == 'UP';
 
-    final color = isUp
-        ? const Color(0xFF00E676)
+    final isDown = currentSignal.direction == 'DOWN';
+
+    final signalColor = isUp
+        ? const Color(0xFF00C896)
         : isDown
-        ? const Color(0xFFFF5252)
+        ? const Color(0xFFFF5268)
         : Colors.orange;
 
-    final title = isUp
-        ? 'ALZA'
-        : isDown
-        ? 'BAJA'
-        : 'ESPERAR';
-
-    return Card(
-      child: Container(
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: color.withValues(alpha: 0.35)),
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(22),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [signalColor.withOpacity(.17), const Color(0xFF101720)],
         ),
-        child: Column(
-          children: [
-            const Text(
-              'SEÑAL',
-              style: TextStyle(
-                color: Colors.white54,
-                fontSize: 12,
-                letterSpacing: 2,
+        border: Border.all(color: signalColor.withOpacity(.35)),
+        boxShadow: [
+          BoxShadow(
+            color: signalColor.withOpacity(.08),
+            blurRadius: 30,
+            spreadRadius: 1,
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'SEÑAL ${currentSignal.timeframe.toUpperCase()}',
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.4,
+                  color: Colors.white54,
+                ),
               ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text(
-                  result.arrow,
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(20),
+                  color: signalColor.withOpacity(.13),
+                ),
+                child: Text(
+                  currentSignal.strength,
                   style: TextStyle(
-                    fontSize: 44,
-                    color: color,
+                    color: signalColor,
+                    fontSize: 10,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
-                const SizedBox(width: 12),
-                Text(
-                  title,
-                  style: TextStyle(
-                    color: color,
-                    fontSize: 34,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: color.withValues(alpha: 0.10),
-                borderRadius: BorderRadius.circular(30),
               ),
-              child: Text(
-                result.strength,
-                style: TextStyle(color: color, fontWeight: FontWeight.bold),
-              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            currentSignal.arrow,
+            style: TextStyle(
+              fontSize: 64,
+              height: 1,
+              color: signalColor,
+              fontWeight: FontWeight.bold,
             ),
-            const SizedBox(height: 15),
-            Text(
-              result.setup,
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 3),
+          Text(
+            currentSignal.direction == 'UP'
+                ? 'ALZA'
+                : currentSignal.direction == 'DOWN'
+                ? 'BAJA'
+                : 'ESPERAR',
+            style: TextStyle(
+              color: signalColor,
+              fontSize: 28,
+              fontWeight: FontWeight.w900,
+              letterSpacing: 1,
             ),
-            const SizedBox(height: 6),
-            Text(
-              result.reason,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white60),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            currentSignal.setup,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
             ),
-            const SizedBox(height: 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                _stat('SCORE', '${result.score}/${result.maxScore}'),
-                _stat(
-                  'PRECIO',
-                  formatPrice(result.referencePrice, selectedPair),
+          ),
+          const SizedBox(height: 18),
+          Row(
+            children: [
+              Expanded(
+                child: _metricBox(
+                  'SCORE',
+                  '${currentSignal.score}/${currentSignal.maxScore}',
                 ),
-                _stat('MOMENTUM', '${result.momentum.toStringAsFixed(3)}%'),
-              ],
-            ),
-          ],
-        ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(child: _metricBox('TENDENCIA', currentSignal.trend)),
+              const SizedBox(width: 8),
+              Expanded(child: _metricBox('VELA', currentSignal.candle)),
+            ],
+          ),
+        ],
       ),
     );
   }
 
-  Widget _stat(String title, String value) {
-    return Column(
-      children: [
-        Text(
-          title,
-          style: const TextStyle(fontSize: 10, color: Colors.white38),
+  Widget _metricBox(String title, String value) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(.035),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        children: [
+          Text(
+            title,
+            style: const TextStyle(
+              color: Colors.white38,
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ==========================================================
+  // ENTRY TIMER
+  // ==========================================================
+
+  Widget _buildEntryTimer() {
+    final active = entrySecondsRemaining > 0 && signal?.direction != 'WAIT';
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: active
+            ? const Color(0xFF00C896).withOpacity(.07)
+            : const Color(0xFF101720),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: active
+              ? const Color(0xFF00C896).withOpacity(.25)
+              : Colors.white.withOpacity(.06),
         ),
-        const SizedBox(height: 4),
-        Text(value, style: const TextStyle(fontWeight: FontWeight.bold)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 45,
+            height: 45,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: active
+                  ? const Color(0xFF00C896).withOpacity(.13)
+                  : Colors.white.withOpacity(.04),
+            ),
+            child: Icon(
+              Icons.timer_outlined,
+              color: active ? const Color(0xFF00C896) : Colors.white38,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'VENTANA DE ENTRADA',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1,
+                    color: Colors.white54,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  active
+                      ? '$entrySecondsRemaining segundos'
+                      : 'Esperando nueva señal',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Text(
+            active ? '$entrySecondsRemaining' : '--',
+            style: TextStyle(
+              fontSize: 27,
+              fontWeight: FontWeight.w900,
+              color: active ? const Color(0xFF00C896) : Colors.white38,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ==========================================================
+  // MARKET INFO
+  // ==========================================================
+
+  Widget _buildMarketInfo() {
+    final price =
+        liveTick?.price ?? (candles.isNotEmpty ? candles.last.close : 0);
+
+    return Row(
+      children: [
+        Expanded(
+          child: _infoCard(
+            icon: Icons.price_change,
+            title: 'PRECIO',
+            value: price > 0 ? formatPrice(price) : '--',
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: _infoCard(
+            icon: Icons.schedule,
+            title: 'PRÓXIMA VELA',
+            value: secondsToNextCandle > 0
+                ? _formatDuration(secondsToNextCandle)
+                : '--',
+          ),
+        ),
       ],
     );
   }
 
-  // ==========================================================
-  // TEMPORIZADOR DE ENTRADA
-  // ==========================================================
-
-  Widget _buildEntryTimer(SignalResult result) {
-    final active = entryTimerActive && result.direction != 'WAIT';
-
-    final isUp = entrySignalDirection == 'UP';
-
-    final color = isUp ? const Color(0xFF00E676) : const Color(0xFFFF5252);
-
-    final percentage = entryWindowSeconds <= 0
-        ? 0.0
-        : entrySecondsRemaining / entryWindowSeconds;
-
-    return Card(
-      child: Container(
-        padding: const EdgeInsets.all(18),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: active ? color.withValues(alpha: 0.45) : Colors.white10,
+  Widget _infoCard({
+    required IconData icon,
+    required String title,
+    required String value,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF101720),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white.withOpacity(.06)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 21, color: Colors.white54),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 9,
+                    color: Colors.white38,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  value,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
           ),
-        ),
-        child: Column(
-          children: [
-            Row(
-              children: [
-                Icon(
-                  active ? Icons.bolt : Icons.timer_off_outlined,
-                  color: active ? color : Colors.white38,
-                ),
-                const SizedBox(width: 8),
-                const Expanded(
-                  child: Text(
-                    'PUNTO DE ENTRADA',
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 1,
-                    ),
-                  ),
-                ),
-                if (active)
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 5,
-                    ),
-                    decoration: BoxDecoration(
-                      color: color.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Text(
-                      entrySignalDirection == 'UP' ? 'ALZA' : 'BAJA',
-                      style: TextStyle(
-                        color: color,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 15),
-            Text(
-              active ? '$entrySecondsRemaining s' : 'ESPERANDO NUEVA SEÑAL',
-              style: TextStyle(
-                fontSize: active ? 34 : 16,
-                fontWeight: FontWeight.w900,
-                color: active ? color : Colors.white38,
-              ),
-            ),
-            const SizedBox(height: 10),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(20),
-              child: LinearProgressIndicator(
-                minHeight: 7,
-                value: active ? percentage : 0,
-                backgroundColor: Colors.white10,
-                valueColor: AlwaysStoppedAnimation<Color>(
-                  active ? color : Colors.white24,
-                ),
-              ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              active
-                  ? 'Ventana inicial de entrada detectada'
-                  : 'El temporizador se activa cuando aparece una nueva señal.',
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white54, fontSize: 11),
-            ),
-          ],
-        ),
+        ],
       ),
     );
   }
 
-  // ==========================================================
-  // LIVE PRICE
-  // ==========================================================
+  String _formatDuration(int seconds) {
+    final minutes = seconds ~/ 60;
 
-  Widget _buildLivePriceCard() {
-    final tick = liveTick;
+    final remaining = seconds % 60;
 
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Row(
-              children: [
-                const Icon(Icons.flash_on, color: Color(0xFF00D4FF)),
-                const SizedBox(width: 8),
-                const Expanded(
-                  child: Text(
-                    'PRECIO EN TIEMPO REAL',
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                ),
-                if (tick != null)
-                  Text(
-                    tick.direction,
-                    style: TextStyle(
-                      color: tick.direction == 'UP'
-                          ? Colors.greenAccent
-                          : tick.direction == 'DOWN'
-                          ? Colors.redAccent
-                          : Colors.white54,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Text(
-              currentPrice > 0 ? formatPrice(currentPrice, selectedPair) : '--',
-              style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w900),
-            ),
-            if (tick != null) ...[
-              const SizedBox(height: 8),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text(
-                    'BID ${formatPrice(tick.bid, selectedPair)}',
-                    style: const TextStyle(color: Colors.white54, fontSize: 12),
-                  ),
-                  const SizedBox(width: 15),
-                  Text(
-                    'ASK ${formatPrice(tick.ask, selectedPair)}',
-                    style: const TextStyle(color: Colors.white54, fontSize: 12),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 5),
-              Text(
-                tick.stale ? 'PRECIO DESACTUALIZADO' : 'TICK RECIBIDO EN VIVO',
-                style: TextStyle(
-                  color: tick.stale ? Colors.orange : const Color(0xFF00E676),
-                  fontSize: 11,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
+    if (minutes > 0) {
+      return '${minutes}m ${remaining}s';
+    }
 
-  // ==========================================================
-  // COUNTDOWN VELA
-  // ==========================================================
-
-  Widget _buildCountdownCard() {
-    final mins = secondsToNextCandle ~/ 60;
-
-    final secs = secondsToNextCandle % 60;
-
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Row(
-          children: [
-            const Icon(Icons.timer_outlined, color: Colors.orange),
-            const SizedBox(width: 10),
-            const Expanded(
-              child: Text(
-                'PRÓXIMA VELA',
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-            ),
-            Text(
-              '${mins.toString().padLeft(2, '0')}:'
-              '${secs.toString().padLeft(2, '0')}',
-              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
-            ),
-          ],
-        ),
-      ),
-    );
+    return '${remaining}s';
   }
 
   // ==========================================================
@@ -2478,184 +2544,225 @@ class _HomePageState extends State<HomePage> {
 
   Widget _buildChart() {
     if (candles.isEmpty) {
-      return const SizedBox();
+      return const SizedBox.shrink();
     }
 
-    final chartCandles = candles.length > 70
-        ? candles.sublist(candles.length - 70)
+    final visible = candles.length > 80
+        ? candles.sublist(candles.length - 80)
         : candles;
 
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.only(top: 15, right: 8, bottom: 10),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Padding(
-              padding: EdgeInsets.only(left: 14, bottom: 12),
-              child: Text(
-                'ACCIÓN DEL PRECIO',
-                style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1),
-              ),
-            ),
-            SizedBox(
-              height: 360,
-              child: SfCartesianChart(
-                backgroundColor: Colors.transparent,
-                plotAreaBorderWidth: 0,
-                primaryXAxis: DateTimeAxis(
-                  majorGridLines: const MajorGridLines(width: 0),
-                  dateFormat: DateFormat('HH:mm'),
-                  labelStyle: const TextStyle(
-                    color: Colors.white38,
-                    fontSize: 10,
-                  ),
-                ),
-                primaryYAxis: NumericAxis(
-                  opposedPosition: true,
-                  majorGridLines: const MajorGridLines(width: 0.25),
-                  labelStyle: const TextStyle(
-                    color: Colors.white38,
-                    fontSize: 10,
-                  ),
-                  numberFormat: _chartNumberFormat(),
-                ),
-                series: [
-                  CandleSeries<Candle, DateTime>(
-                    dataSource: chartCandles,
-                    xValueMapper: (Candle candle, _) => candle.time,
-                    lowValueMapper: (Candle candle, _) => candle.low,
-                    highValueMapper: (Candle candle, _) => candle.high,
-                    openValueMapper: (Candle candle, _) => candle.open,
-                    closeValueMapper: (Candle candle, _) => candle.close,
-                    enableTooltip: true,
-                  ),
-                ],
-                tooltipBehavior: TooltipBehavior(enable: true),
-              ),
-            ),
-          ],
-        ),
+    return Container(
+      height: 370,
+      padding: const EdgeInsets.fromLTRB(8, 14, 8, 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF101720),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withOpacity(.06)),
       ),
-    );
-  }
-
-  NumberFormat _chartNumberFormat() {
-    return NumberFormat(selectedPair.contains('JPY') ? '0.000' : '0.00000');
-  }
-
-  // ==========================================================
-  // ANALYSIS
-  // ==========================================================
-
-  Widget _buildAnalysis(SignalResult result) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'ANÁLISIS',
-              style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1),
-            ),
-            const SizedBox(height: 14),
-            _analysisRow(
-              'Estructura',
-              result.structureBullish
-                  ? 'ALCISTA'
-                  : result.structureBearish
-                  ? 'BAJISTA'
-                  : 'NEUTRAL',
-            ),
-            _analysisRow(
-              'BOS',
-              result.bosBullish
-                  ? 'ALCISTA'
-                  : result.bosBearish
-                  ? 'BAJISTA'
-                  : 'NO',
-            ),
-            _analysisRow(
-              'CHoCH',
-              result.chochBullish
-                  ? 'ALCISTA'
-                  : result.chochBearish
-                  ? 'BAJISTA'
-                  : 'NO',
-            ),
-            _analysisRow('EMA 9', formatPrice(result.emaFast, selectedPair)),
-            _analysisRow('EMA 21', formatPrice(result.emaSlow, selectedPair)),
-            _analysisRow('ATR', formatPrice(result.atr, selectedPair)),
-            _analysisRow('Momentum', '${result.momentum.toStringAsFixed(3)}%'),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _analysisRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 7),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Expanded(
-            child: Text(label, style: const TextStyle(color: Colors.white54)),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 8),
+            child: Text(
+              'GRÁFICO DE PRECIO',
+              style: TextStyle(
+                fontSize: 10,
+                letterSpacing: 1,
+                fontWeight: FontWeight.bold,
+                color: Colors.white54,
+              ),
+            ),
           ),
-          Text(value, style: const TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 10),
+          Expanded(
+            child: SfCartesianChart(
+              backgroundColor: Colors.transparent,
+              plotAreaBorderWidth: 0,
+              primaryXAxis: DateTimeAxis(
+                isVisible: true,
+                dateFormat: DateFormat('HH:mm'),
+                majorGridLines: const MajorGridLines(width: 0.2),
+                labelStyle: const TextStyle(fontSize: 9, color: Colors.white38),
+              ),
+              primaryYAxis: NumericAxis(
+                opposedPosition: true,
+                numberFormat: NumberFormat('0.#####'),
+                majorGridLines: const MajorGridLines(width: 0.2),
+                labelStyle: const TextStyle(fontSize: 9, color: Colors.white38),
+              ),
+              tooltipBehavior: TooltipBehavior(enable: true),
+              series: <CartesianSeries>[
+                CandleSeries<Candle, DateTime>(
+                  dataSource: visible,
+                  xValueMapper: (Candle candle, _) => candle.time.toLocal(),
+                  lowValueMapper: (Candle candle, _) => candle.low,
+                  highValueMapper: (Candle candle, _) => candle.high,
+                  openValueMapper: (Candle candle, _) => candle.open,
+                  closeValueMapper: (Candle candle, _) => candle.close,
+                  enableSolidCandles: true,
+                  bearColor: const Color(0xFFFF5268),
+                  bullColor: const Color(0xFF00C896),
+                  borderWidth: 1,
+                ),
+              ],
+            ),
+          ),
         ],
       ),
     );
   }
 
   // ==========================================================
-  // LEVELS
+  // ANALYSIS
   // ==========================================================
 
-  Widget _buildLevels(SignalResult result) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'NIVELES',
-              style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1),
+  Widget _buildAnalysisCard() {
+    final currentSignal = signal!;
+
+    return Container(
+      padding: const EdgeInsets.all(17),
+      decoration: BoxDecoration(
+        color: const Color(0xFF101720),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withOpacity(.06)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'ANÁLISIS',
+            style: TextStyle(
+              fontSize: 10,
+              letterSpacing: 1.2,
+              fontWeight: FontWeight.bold,
+              color: Colors.white54,
             ),
-            const SizedBox(height: 14),
-            _levelRow(
-              Icons.vertical_align_bottom,
-              'SOPORTE',
-              formatPrice(result.support, selectedPair),
-              Colors.greenAccent,
-            ),
-            const SizedBox(height: 10),
-            _levelRow(
-              Icons.vertical_align_top,
-              'RESISTENCIA',
-              formatPrice(result.resistance, selectedPair),
-              Colors.redAccent,
-            ),
-          ],
-        ),
+          ),
+          const SizedBox(height: 12),
+          _analysisRow('EMA rápida', formatPrice(currentSignal.emaFast)),
+          _analysisRow('EMA lenta', formatPrice(currentSignal.emaSlow)),
+          _analysisRow('ATR', formatPrice(currentSignal.atr)),
+          _analysisRow('Momentum', formatPrice(currentSignal.momentum)),
+          _analysisRow('Tendencia', currentSignal.trend),
+          _analysisRow('Momentum dirección', currentSignal.macd),
+          _analysisRow('Vela', currentSignal.candle),
+          _analysisRow('Temporalidad', currentSignal.timeframe.toUpperCase()),
+          if (_lastAnalysisTime != null)
+            _analysisRow('Último análisis', formatTime(_lastAnalysisTime!)),
+        ],
       ),
     );
   }
 
-  Widget _levelRow(IconData icon, String title, String value, Color color) {
+  Widget _analysisRow(String title, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(color: Colors.white54, fontSize: 12),
+          ),
+          Flexible(
+            child: Text(
+              value,
+              textAlign: TextAlign.right,
+              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ==========================================================
+  // SUPPORT / RESISTANCE
+  // ==========================================================
+
+  Widget _buildSupportResistance() {
+    final currentSignal = signal!;
+
     return Row(
       children: [
-        Icon(icon, color: color),
+        Expanded(
+          child: _levelCard(
+            title: 'SOPORTE',
+            value: currentSignal.support > 0
+                ? formatPrice(currentSignal.support)
+                : '--',
+            color: const Color(0xFF00C896),
+            near: currentSignal.nearSupport,
+          ),
+        ),
         const SizedBox(width: 10),
         Expanded(
-          child: Text(title, style: const TextStyle(color: Colors.white54)),
-        ),
-        Text(
-          value,
-          style: TextStyle(color: color, fontWeight: FontWeight.bold),
+          child: _levelCard(
+            title: 'RESISTENCIA',
+            value: currentSignal.resistance > 0
+                ? formatPrice(currentSignal.resistance)
+                : '--',
+            color: const Color(0xFFFF5268),
+            near: currentSignal.nearResistance,
+          ),
         ),
       ],
+    );
+  }
+
+  Widget _levelCard({
+    required String title,
+    required String value,
+    required Color color,
+    required bool near,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(15),
+      decoration: BoxDecoration(
+        color: const Color(0xFF101720),
+        borderRadius: BorderRadius.circular(17),
+        border: Border.all(color: color.withOpacity(.18)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 7,
+                height: 7,
+                decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: 7),
+              Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 9,
+                  color: Colors.white54,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 7),
+          Text(
+            value,
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+          if (near) ...[
+            const SizedBox(height: 5),
+            Text(
+              'PRECIO CERCANO',
+              style: TextStyle(
+                fontSize: 8,
+                fontWeight: FontWeight.bold,
+                color: color,
+              ),
+            ),
+          ],
+        ],
+      ),
     );
   }
 
@@ -2663,74 +2770,100 @@ class _HomePageState extends State<HomePage> {
   // CONFIRMATIONS
   // ==========================================================
 
-  Widget _buildConfirmations(SignalResult result) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'CONFIRMACIONES',
-              style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1),
+  Widget _buildConfirmations() {
+    final currentSignal = signal!;
+
+    return Container(
+      padding: const EdgeInsets.all(17),
+      decoration: BoxDecoration(
+        color: const Color(0xFF101720),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withOpacity(.06)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'CONFIRMACIONES',
+            style: TextStyle(
+              fontSize: 10,
+              letterSpacing: 1.2,
+              fontWeight: FontWeight.bold,
+              color: Colors.white54,
             ),
-            const SizedBox(height: 12),
-            if (result.confirmations.isEmpty)
-              const Text(
-                'Todavía no hay suficientes confirmaciones.',
-                style: TextStyle(color: Colors.white54),
-              )
-            else
-              ...result.confirmations.map(
-                (item) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: Row(
-                    children: [
-                      const Icon(
-                        Icons.check_circle,
-                        size: 17,
-                        color: Color(0xFF00E676),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(child: Text(item)),
-                    ],
-                  ),
-                ),
+          ),
+          const SizedBox(height: 12),
+          if (currentSignal.confirmations.isEmpty)
+            const Text(
+              'No hay confirmaciones suficientes.',
+              style: TextStyle(color: Colors.white54, fontSize: 12),
+            )
+          else
+            ...currentSignal.confirmations.map((item) {
+              return _bulletRow(item, true);
+            }),
+          if (currentSignal.filters.isNotEmpty) ...[
+            const SizedBox(height: 15),
+            const Text(
+              'FILTROS / ALERTAS',
+              style: TextStyle(
+                fontSize: 10,
+                letterSpacing: 1,
+                fontWeight: FontWeight.bold,
+                color: Colors.white54,
               ),
-            if (result.warnings.isNotEmpty) ...[
-              const SizedBox(height: 15),
-              const Text(
-                'FILTROS',
-                style: TextStyle(
-                  color: Colors.orange,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const SizedBox(height: 7),
-              ...result.warnings.map(
-                (item) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 3),
-                  child: Row(
-                    children: [
-                      const Icon(
-                        Icons.remove_circle_outline,
-                        size: 16,
-                        color: Colors.orange,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          item,
-                          style: const TextStyle(color: Colors.white60),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
+            ),
+            const SizedBox(height: 8),
+            ...currentSignal.filters.map((item) {
+              return _bulletRow(item, false);
+            }),
           ],
-        ),
+          const SizedBox(height: 15),
+          const Text(
+            'RAZONES',
+            style: TextStyle(
+              fontSize: 10,
+              letterSpacing: 1,
+              fontWeight: FontWeight.bold,
+              color: Colors.white54,
+            ),
+          ),
+          const SizedBox(height: 8),
+          ...currentSignal.reasons.map((item) {
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 7),
+              child: Text(
+                '• $item',
+                style: const TextStyle(fontSize: 12, color: Colors.white70),
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _bulletRow(String text, bool positive) {
+    final color = positive ? const Color(0xFF00C896) : Colors.orange;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 7),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            positive ? Icons.check_circle : Icons.warning_amber,
+            size: 15,
+            color: color,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(fontSize: 12, color: Colors.white70),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -2740,18 +2873,27 @@ class _HomePageState extends State<HomePage> {
   // ==========================================================
 
   Widget _buildFooter() {
-    return const Column(
+    return Column(
       children: [
         Text(
-          'Trading Signal Bot • Price Action Adaptive V11',
-          textAlign: TextAlign.center,
-          style: TextStyle(color: Colors.white38, fontSize: 12),
+          'Trading Signal Bot',
+          style: TextStyle(
+            color: Colors.white.withOpacity(.35),
+            fontSize: 11,
+            fontWeight: FontWeight.bold,
+          ),
         ),
-        SizedBox(height: 5),
+        const SizedBox(height: 4),
         Text(
-          'Datos: Biquote • Análisis automatizado',
+          'Price Action Adaptive • Multi-Timeframe',
           textAlign: TextAlign.center,
-          style: TextStyle(color: Colors.white24, fontSize: 10),
+          style: TextStyle(color: Colors.white.withOpacity(.22), fontSize: 10),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Las señales son análisis técnico y no garantizan resultados.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.white.withOpacity(.18), fontSize: 9),
         ),
       ],
     );
