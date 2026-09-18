@@ -238,21 +238,11 @@ class BiquoteService {
     return symbol.replaceAll('/', '').toUpperCase();
   }
 
-  // ----------------------------------------------------------
-  // GET CANDLES
-  // ----------------------------------------------------------
-
   static Future<List<Candle>> getCandles(
     String symbol,
     String timeframe, {
     int limit = 200,
   }) async {
-    // --------------------------------------------------------
-    // 2M
-    //
-    // Biquote trabaja con 1m y construimos 2m.
-    // --------------------------------------------------------
-
     if (timeframe == '2m') {
       final oneMinute = await getCandles(
         symbol,
@@ -312,17 +302,6 @@ class BiquoteService {
       throw Exception('Biquote devolvió una respuesta JSON inválida');
     }
 
-    // --------------------------------------------------------
-    // Biquote:
-    //
-    // {
-    //   "symbol": "EURUSD",
-    //   "interval": "1m",
-    //   "bars": [...]
-    // }
-    //
-    // --------------------------------------------------------
-
     List<dynamic> bars = [];
 
     if (decoded is Map) {
@@ -332,7 +311,6 @@ class BiquoteService {
         bars = rawBars;
       }
 
-      // Compatibilidad con otras respuestas.
       if (bars.isEmpty) {
         final alternatives = [
           decoded['data'],
@@ -354,7 +332,8 @@ class BiquoteService {
 
     if (bars.isEmpty) {
       throw Exception(
-        'Biquote respondió correctamente pero no devolvió barras para $symbol $timeframe',
+        'Biquote respondió correctamente pero no devolvió barras para '
+        '$symbol $timeframe',
       );
     }
 
@@ -389,10 +368,6 @@ class BiquoteService {
 
     return result;
   }
-
-  // ----------------------------------------------------------
-  // AGREGAR
-  // ----------------------------------------------------------
 
   static List<Candle> aggregateCandles(List<Candle> source, Duration duration) {
     if (source.isEmpty) {
@@ -488,18 +463,15 @@ class Technical {
     }
 
     double avgGain = gains / period;
-
     double avgLoss = losses / period;
 
     for (int i = period + 1; i < closes.length; i++) {
       final change = closes[i] - closes[i - 1];
 
       final gain = change > 0 ? change : 0.0;
-
       final loss = change < 0 ? change.abs() : 0.0;
 
       avgGain = ((avgGain * (period - 1)) + gain) / period;
-
       avgLoss = ((avgLoss * (period - 1)) + loss) / period;
     }
 
@@ -514,9 +486,7 @@ class Technical {
 
   static double trueRange(Candle current, Candle previous) {
     final a = current.high - current.low;
-
     final b = (current.high - previous.close).abs();
-
     final c = (current.low - previous.close).abs();
 
     return max(a, max(b, c));
@@ -547,7 +517,6 @@ class Technical {
     }
 
     final fast = ema(closes, 12);
-
     final slow = ema(closes, 26);
 
     return fast - slow;
@@ -580,17 +549,14 @@ class Technical {
 
     for (int i = 1; i < candles.length; i++) {
       final current = candles[i];
-
       final previous = candles[i - 1];
 
       trs.add(trueRange(current, previous));
 
       final upMove = current.high - previous.high;
-
       final downMove = previous.low - current.low;
 
       plusDm.add(upMove > downMove && upMove > 0 ? upMove : 0);
-
       minusDm.add(downMove > upMove && downMove > 0 ? downMove : 0);
     }
 
@@ -615,7 +581,6 @@ class Technical {
       }
 
       final plusDi = 100 * plusSum / trSum;
-
       final minusDi = 100 * minusSum / trSum;
 
       final denominator = plusDi + minusDi;
@@ -641,11 +606,39 @@ class Technical {
 
 // ============================================================
 // PRICE ACTION ENGINE
+//
+// CAMBIO PRINCIPAL:
+//
+// El motor anterior necesitaba demasiadas condiciones simultáneas.
+// Ahora utiliza tres rutas:
+//
+// 1. CONTINUACIÓN
+// 2. RUPTURA
+// 3. REVERSIÓN
+//
+// Cada ruta tiene sus propios requisitos.
+// Los filtros de seguridad permanecen.
+//
+// Esto permite encontrar más setups sin convertir cualquier
+// movimiento pequeño en una señal.
 // ============================================================
 
 class TradingStrategy {
-  static const int minimumScore = 60;
-  static const double minimumMargin = 8;
+  // Antes: 60.
+  //
+  // Ahora:
+  // 56 permite capturar configuraciones buenas que antes quedaban
+  // fuera por unos pocos puntos.
+  static const double minimumScore = 56;
+
+  // Antes: 8.
+  //
+  // Una ventaja de 6 puntos sigue exigiendo que una dirección
+  // domine claramente a la otra.
+  static const double minimumMargin = 6;
+
+  // Dos confirmaciones siguen siendo necesarias para la mayoría
+  // de las señales.
   static const int minimumConfirmations = 2;
 
   static SignalResult analyze(List<Candle> source, String timeframe) {
@@ -664,37 +657,34 @@ class TradingStrategy {
 
     final last = recent.last;
 
+    final previous = recent.length >= 2 ? recent[recent.length - 2] : last;
+
     final closes = recent.map((e) => e.close).toList();
 
-    // ----------------------------------------------------------
-    // INDICADORES INFORMATIVOS
-    // ----------------------------------------------------------
+    // ==========================================================
+    // INDICADORES
+    // ==========================================================
 
     final ema20 = Technical.ema(closes, 20);
-
     final ema50 = Technical.ema(closes, 50);
 
     final rsi = Technical.rsi(closes);
 
     final macd = Technical.macd(closes);
-
     final macdSignal = Technical.macdSignal(closes);
 
     final adx = Technical.adx(recent);
-
     final atr = Technical.atr(recent);
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // PIVOTS
-    // ----------------------------------------------------------
+    // ==========================================================
 
     final pivotHighs = <int>[];
-
     final pivotLows = <int>[];
 
     for (int i = 2; i < recent.length - 2; i++) {
       final high = recent[i].high;
-
       final low = recent[i].low;
 
       final isHigh =
@@ -718,12 +708,11 @@ class TradingStrategy {
       }
     }
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // ESTRUCTURA
-    // ----------------------------------------------------------
+    // ==========================================================
 
     bool bullishStructure = false;
-
     bool bearishStructure = false;
 
     if (pivotHighs.length >= 2 && pivotLows.length >= 2) {
@@ -736,13 +725,51 @@ class TradingStrategy {
       final l2 = recent[pivotLows.last].low;
 
       bullishStructure = h2 > h1 && l2 > l1;
-
       bearishStructure = h2 < h1 && l2 < l1;
     }
 
-    // ----------------------------------------------------------
+    // ==========================================================
+    // ESTRUCTURA RECIENTE
+    //
+    // Esto ayuda a detectar cambios antes de que haya una
+    // estructura HH+HL / LH+LL totalmente formada.
+    // ==========================================================
+
+    final recentLookback = min(8, recent.length - 1);
+
+    final recentHigh = recent
+        .sublist(recent.length - recentLookback - 1)
+        .map((e) => e.high)
+        .reduce(max);
+
+    final recentLow = recent
+        .sublist(recent.length - recentLookback - 1)
+        .map((e) => e.low)
+        .reduce(min);
+
+    final previousHigh = recent.length >= 12
+        ? recent
+              .sublist(recent.length - 12, recent.length - 5)
+              .map((e) => e.high)
+              .reduce(max)
+        : recentHigh;
+
+    final previousLow = recent.length >= 12
+        ? recent
+              .sublist(recent.length - 12, recent.length - 5)
+              .map((e) => e.low)
+              .reduce(min)
+        : recentLow;
+
+    final recentBullishBreak =
+        last.close > previousHigh && last.close > last.open;
+
+    final recentBearishBreak =
+        last.close < previousLow && last.close < last.open;
+
+    // ==========================================================
     // SOPORTE / RESISTENCIA
-    // ----------------------------------------------------------
+    // ==========================================================
 
     final resistance = pivotHighs.isNotEmpty
         ? recent[pivotHighs.last].high
@@ -758,37 +785,34 @@ class TradingStrategy {
               .map((e) => e.low)
               .reduce(min);
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // BOS
-    // ----------------------------------------------------------
+    // ==========================================================
 
     bool bullishBos = false;
-
     bool bearishBos = false;
 
     if (pivotHighs.isNotEmpty) {
       final high = recent[pivotHighs.last].high;
-
       bullishBos = last.close > high;
     }
 
     if (pivotLows.isNotEmpty) {
       final low = recent[pivotLows.last].low;
-
       bearishBos = last.close < low;
     }
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // CHOCH
-    // ----------------------------------------------------------
+    // ==========================================================
 
-    final bullishChoch = bullishBos && bearishStructure;
+    final bullishChoch = (bullishBos || recentBullishBreak) && bearishStructure;
 
-    final bearishChoch = bearishBos && bullishStructure;
+    final bearishChoch = (bearishBos || recentBearishBreak) && bullishStructure;
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // VELA
-    // ----------------------------------------------------------
+    // ==========================================================
 
     final range = max(last.high - last.low, 0.00000001);
 
@@ -802,25 +826,22 @@ class TradingStrategy {
 
     final strongBull =
         last.close > last.open &&
-        bodyRatio >= 0.55 &&
-        last.close >= last.low + range * 0.70;
+        bodyRatio >= 0.50 &&
+        last.close >= last.low + range * 0.65;
 
     final strongBear =
         last.close < last.open &&
-        bodyRatio >= 0.55 &&
-        last.close <= last.high - range * 0.70;
+        bodyRatio >= 0.50 &&
+        last.close <= last.high - range * 0.65;
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // ENGULFING
-    // ----------------------------------------------------------
+    // ==========================================================
 
     bool bullishEngulfing = false;
-
     bool bearishEngulfing = false;
 
     if (recent.length >= 2) {
-      final previous = recent[recent.length - 2];
-
       bullishEngulfing =
           previous.close < previous.open &&
           last.close > last.open &&
@@ -834,25 +855,25 @@ class TradingStrategy {
           last.close <= previous.open;
     }
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // REJECTION
-    // ----------------------------------------------------------
+    // ==========================================================
 
     final bullishRejection =
-        lowerWick >= body * 1.25 &&
+        lowerWick >= body * 1.15 &&
         lowerWick > upperWick &&
-        last.close > last.low + range * 0.55;
+        last.close > last.low + range * 0.52;
 
     final bearishRejection =
-        upperWick >= body * 1.25 &&
+        upperWick >= body * 1.15 &&
         upperWick > lowerWick &&
-        last.close < last.high - range * 0.55;
+        last.close < last.high - range * 0.52;
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // RANGO PROMEDIO
-    // ----------------------------------------------------------
+    // ==========================================================
 
-    final rangeWindow = recent.sublist(max(0, recent.length - 12));
+    final rangeWindow = recent.sublist(max(0, recent.length - 14));
 
     final ranges = rangeWindow.map((e) => e.high - e.low).toList();
 
@@ -860,22 +881,21 @@ class TradingStrategy {
         ? range
         : ranges.reduce((a, b) => a + b) / ranges.length;
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // DISPLACEMENT
-    // ----------------------------------------------------------
+    // ==========================================================
 
-    final displacement = range >= avgRange * 1.20 && bodyRatio >= 0.55;
+    final displacement = range >= avgRange * 1.15 && bodyRatio >= 0.50;
 
     final bullishDisplacement = displacement && last.close > last.open;
 
     final bearishDisplacement = displacement && last.close < last.open;
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // SWEEP
-    // ----------------------------------------------------------
+    // ==========================================================
 
     bool bullishSweep = false;
-
     bool bearishSweep = false;
 
     if (recent.length >= 5) {
@@ -886,31 +906,28 @@ class TradingStrategy {
       bearishSweep = last.high > reference.high && last.close < reference.high;
     }
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // RETEST
-    // ----------------------------------------------------------
+    // ==========================================================
 
     final bullishRetest =
         bullishBos &&
-        last.low <= resistance * 1.0005 &&
+        last.low <= resistance + atr * 0.15 &&
         last.close > resistance;
 
     final bearishRetest =
-        bearishBos && last.high >= support * 0.9995 && last.close < support;
+        bearishBos && last.high >= support - atr * 0.15 && last.close < support;
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // FVG
-    // ----------------------------------------------------------
+    // ==========================================================
 
     bool bullishFvg = false;
-
     bool bearishFvg = false;
 
     if (recent.length >= 3) {
       final a = recent[recent.length - 3];
-
       final b = recent[recent.length - 2];
-
       final c = recent.last;
 
       bullishFvg = c.low > a.high && b.close > b.open;
@@ -918,60 +935,115 @@ class TradingStrategy {
       bearishFvg = c.high < a.low && b.close < b.open;
     }
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // ORDER BLOCK
-    // ----------------------------------------------------------
+    // ==========================================================
 
     bool bullishOb = false;
-
     bool bearishOb = false;
 
     if (recent.length >= 4) {
-      final previous = recent[recent.length - 2];
+      final candleBefore = recent[recent.length - 2];
 
-      bullishOb = previous.close < previous.open && last.close > previous.high;
+      bullishOb =
+          candleBefore.close < candleBefore.open &&
+          last.close > candleBefore.high;
 
-      bearishOb = previous.close > previous.open && last.close < previous.low;
+      bearishOb =
+          candleBefore.close > candleBefore.open &&
+          last.close < candleBefore.low;
     }
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // NIVELES
-    // ----------------------------------------------------------
+    // ==========================================================
 
-    final levelDistance = max(atr, avgRange * 0.50);
+    final levelDistance = max(atr * 0.75, avgRange * 0.45);
 
     final nearSupport = (last.close - support).abs() <= levelDistance;
 
     final nearResistance = (last.close - resistance).abs() <= levelDistance;
 
-    // ----------------------------------------------------------
+    // ==========================================================
+    // TENDENCIA EMA
+    //
+    // No obliga a que EMA sea perfecta.
+    // Se utiliza como confirmación.
+    // ==========================================================
+
+    final emaBullish = ema20 > ema50;
+    final emaBearish = ema20 < ema50;
+
+    final emaDistance = ema50 == 0
+        ? 0.0
+        : ((ema20 - ema50).abs() / ema50) * 100;
+
+    final emaNeutral = emaDistance < 0.015;
+
+    // ==========================================================
+    // MOMENTUM
+    // ==========================================================
+
+    final macdBullish = macd > macdSignal;
+    final macdBearish = macd < macdSignal;
+
+    final rsiBullish = rsi >= 48 && rsi <= 68;
+    final rsiBearish = rsi >= 32 && rsi <= 52;
+
+    // Evitamos entrar cuando RSI está extremadamente extendido.
+    final rsiOverbought = rsi >= 73;
+    final rsiOversold = rsi <= 27;
+
+    // ==========================================================
+    // ADX
+    //
+    // Ya no exige ADX >= 20 para absolutamente todo.
+    // Pero un ADX extremadamente bajo sí penaliza.
+    // ==========================================================
+
+    final strongTrend = adx >= 20;
+    final usableTrend = adx >= 16;
+    final deadMarket = adx < 12;
+
+    // ==========================================================
     // CONTEXTO
-    // ----------------------------------------------------------
+    // ==========================================================
 
-    final bullishContext = bullishStructure || bullishBos || bullishChoch;
+    final bullishContext =
+        bullishStructure ||
+        bullishBos ||
+        bullishChoch ||
+        recentBullishBreak ||
+        (emaBullish && !emaNeutral);
 
-    final bearishContext = bearishStructure || bearishBos || bearishChoch;
+    final bearishContext =
+        bearishStructure ||
+        bearishBos ||
+        bearishChoch ||
+        recentBearishBreak ||
+        (emaBearish && !emaNeutral);
 
-    // ----------------------------------------------------------
-    // TRIGGER
-    // ----------------------------------------------------------
+    // ==========================================================
+    // TRIGGERS
+    // ==========================================================
 
     final bullishTrigger =
         strongBull ||
         bullishEngulfing ||
         bullishRejection ||
-        bullishDisplacement;
+        bullishDisplacement ||
+        bullishSweep;
 
     final bearishTrigger =
         strongBear ||
         bearishEngulfing ||
         bearishRejection ||
-        bearishDisplacement;
+        bearishDisplacement ||
+        bearishSweep;
 
-    // ----------------------------------------------------------
-    // SCORE DE ESTRUCTURA
-    // Máximo 35.
-    // ----------------------------------------------------------
+    // ==========================================================
+    // SCORE DE TENDENCIA / ESTRUCTURA
+    // ==========================================================
 
     double callContext = 0;
     double putContext = 0;
@@ -988,6 +1060,14 @@ class TradingStrategy {
       callContext += 20;
     }
 
+    if (recentBullishBreak) {
+      callContext += 12;
+    }
+
+    if (emaBullish) {
+      callContext += 8;
+    }
+
     if (bearishStructure) {
       putContext += 18;
     }
@@ -1000,14 +1080,20 @@ class TradingStrategy {
       putContext += 20;
     }
 
-    callContext = min(callContext, 35);
+    if (recentBearishBreak) {
+      putContext += 12;
+    }
 
+    if (emaBearish) {
+      putContext += 8;
+    }
+
+    callContext = min(callContext, 35);
     putContext = min(putContext, 35);
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // SCORE LIQUIDEZ
-    // Máximo 20.
-    // ----------------------------------------------------------
+    // ==========================================================
 
     double callLiquidity = 0;
     double putLiquidity = 0;
@@ -1037,13 +1123,11 @@ class TradingStrategy {
     }
 
     callLiquidity = min(callLiquidity, 20);
-
     putLiquidity = min(putLiquidity, 20);
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // SCORE TRIGGER
-    // Máximo 30.
-    // ----------------------------------------------------------
+    // ==========================================================
 
     double callTrigger = 0;
     double putTrigger = 0;
@@ -1064,6 +1148,10 @@ class TradingStrategy {
       callTrigger += 7;
     }
 
+    if (bullishSweep) {
+      callTrigger += 5;
+    }
+
     if (bearishEngulfing) {
       putTrigger += 14;
     }
@@ -1080,14 +1168,16 @@ class TradingStrategy {
       putTrigger += 7;
     }
 
-    callTrigger = min(callTrigger, 30);
+    if (bearishSweep) {
+      putTrigger += 5;
+    }
 
+    callTrigger = min(callTrigger, 30);
     putTrigger = min(putTrigger, 30);
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // IMBALANCE
-    // Máximo 10.
-    // ----------------------------------------------------------
+    // ==========================================================
 
     double callImbalance = 0;
     double putImbalance = 0;
@@ -1109,21 +1199,79 @@ class TradingStrategy {
     }
 
     callImbalance = min(callImbalance, 10);
-
     putImbalance = min(putImbalance, 10);
 
-    // ----------------------------------------------------------
+    // ==========================================================
+    // INDICADORES
+    //
+    // Ahora aportan puntos en lugar de ser bloqueadores absolutos.
+    // ==========================================================
+
+    double callMomentum = 0;
+    double putMomentum = 0;
+
+    if (emaBullish) {
+      callMomentum += 4;
+    }
+
+    if (emaBearish) {
+      putMomentum += 4;
+    }
+
+    if (macdBullish) {
+      callMomentum += 5;
+    }
+
+    if (macdBearish) {
+      putMomentum += 5;
+    }
+
+    if (rsiBullish) {
+      callMomentum += 4;
+    }
+
+    if (rsiBearish) {
+      putMomentum += 4;
+    }
+
+    if (strongTrend) {
+      if (bullishContext) {
+        callMomentum += 4;
+      }
+
+      if (bearishContext) {
+        putMomentum += 4;
+      }
+    } else if (usableTrend) {
+      if (bullishContext) {
+        callMomentum += 2;
+      }
+
+      if (bearishContext) {
+        putMomentum += 2;
+      }
+    }
+
+    callMomentum = min(callMomentum, 15);
+    putMomentum = min(putMomentum, 15);
+
+    // ==========================================================
     // SCORE FINAL
-    // ----------------------------------------------------------
+    // ==========================================================
 
     double callScore =
-        callContext + callLiquidity + callTrigger + callImbalance;
+        callContext +
+        callLiquidity +
+        callTrigger +
+        callImbalance +
+        callMomentum;
 
-    double putScore = putContext + putLiquidity + putTrigger + putImbalance;
+    double putScore =
+        putContext + putLiquidity + putTrigger + putImbalance + putMomentum;
 
-    // ----------------------------------------------------------
-    // CONFLICTOS
-    // ----------------------------------------------------------
+    // ==========================================================
+    // CONFLICTO
+    // ==========================================================
 
     final strongConflict =
         (bullishBos && bearishBos) ||
@@ -1132,45 +1280,49 @@ class TradingStrategy {
         (bullishTrigger && bearishTrigger);
 
     if (strongConflict) {
-      callScore -= 15;
-      putScore -= 15;
+      callScore -= 18;
+      putScore -= 18;
     }
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // EXTENSIÓN
-    // ----------------------------------------------------------
+    // ==========================================================
 
     final overextended = range > avgRange * 2.50;
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // INDECISIÓN
-    // ----------------------------------------------------------
+    // ==========================================================
 
-    final indecision = bodyRatio < 0.15;
+    final indecision = bodyRatio < 0.12;
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // BLOQUEOS
-    // ----------------------------------------------------------
+    // ==========================================================
 
-    final callBlocked = nearResistance && !bullishBos && !bullishSweep;
+    final callBlocked =
+        nearResistance && !bullishBos && !bullishSweep && !bullishDisplacement;
 
-    final putBlocked = nearSupport && !bearishBos && !bearishSweep;
+    final putBlocked =
+        nearSupport && !bearishBos && !bearishSweep && !bearishDisplacement;
 
-    // ----------------------------------------------------------
-    // CONFIRMACIONES INDEPENDIENTES
-    // ----------------------------------------------------------
+    // ==========================================================
+    // CONFIRMACIONES
+    // ==========================================================
 
     int callConfirmations = 0;
     int putConfirmations = 0;
 
-    if (bullishContext) {
+    // Estructura
+    if (bullishStructure || bullishBos || bullishChoch || recentBullishBreak) {
       callConfirmations++;
     }
 
-    if (bearishContext) {
+    if (bearishStructure || bearishBos || bearishChoch || recentBearishBreak) {
       putConfirmations++;
     }
 
+    // Liquidez / niveles
     if (bullishSweep || bullishRetest || nearSupport) {
       callConfirmations++;
     }
@@ -1179,6 +1331,7 @@ class TradingStrategy {
       putConfirmations++;
     }
 
+    // Trigger
     if (bullishTrigger) {
       callConfirmations++;
     }
@@ -1187,6 +1340,7 @@ class TradingStrategy {
       putConfirmations++;
     }
 
+    // Imbalance
     if (bullishFvg || bullishOb) {
       callConfirmations++;
     }
@@ -1195,13 +1349,28 @@ class TradingStrategy {
       putConfirmations++;
     }
 
-    // ----------------------------------------------------------
+    // Momentum
+    if (emaBullish && macdBullish) {
+      callConfirmations++;
+    }
+
+    if (emaBearish && macdBearish) {
+      putConfirmations++;
+    }
+
+    // ==========================================================
     // SETUPS
-    // ----------------------------------------------------------
+    // ==========================================================
 
-    final continuationCall = bullishContext && bullishTrigger;
+    final continuationCall =
+        bullishContext &&
+        bullishTrigger &&
+        (emaBullish || bullishStructure || bullishBos);
 
-    final continuationPut = bearishContext && bearishTrigger;
+    final continuationPut =
+        bearishContext &&
+        bearishTrigger &&
+        (emaBearish || bearishStructure || bearishBos);
 
     final reversalCall =
         bullishSweep &&
@@ -1213,24 +1382,63 @@ class TradingStrategy {
         bearishTrigger &&
         (nearResistance || bearishChoch || bearishBos);
 
-    final breakoutCall = bullishBos && bullishTrigger;
+    final breakoutCall = (bullishBos || recentBullishBreak) && bullishTrigger;
 
-    final breakoutPut = bearishBos && bearishTrigger;
+    final breakoutPut = (bearishBos || recentBearishBreak) && bearishTrigger;
 
-    final validCall = continuationCall || reversalCall || breakoutCall;
+    // ==========================================================
+    // RUTA ADICIONAL
+    //
+    // Esta es una de las partes que aumenta la frecuencia.
+    //
+    // Permite una entrada cuando hay tendencia + momentum +
+    // trigger aunque todavía no exista un HH/HL completo.
+    // ==========================================================
 
-    final validPut = continuationPut || reversalPut || breakoutPut;
+    final earlyContinuationCall =
+        emaBullish &&
+        macdBullish &&
+        rsiBullish &&
+        bullishTrigger &&
+        !nearResistance;
 
-    // ----------------------------------------------------------
-    // VALIDACIÓN
-    // ----------------------------------------------------------
+    final earlyContinuationPut =
+        emaBearish &&
+        macdBearish &&
+        rsiBearish &&
+        bearishTrigger &&
+        !nearSupport;
 
-    final commonBlocked = overextended || indecision || strongConflict;
+    final validCall =
+        continuationCall ||
+        reversalCall ||
+        breakoutCall ||
+        earlyContinuationCall;
+
+    final validPut =
+        continuationPut || reversalPut || breakoutPut || earlyContinuationPut;
+
+    // ==========================================================
+    // FILTROS DE SEGURIDAD
+    // ==========================================================
+
+    final commonBlocked =
+        overextended || indecision || strongConflict || deadMarket;
+
+    // ==========================================================
+    // VALIDACIÓN PRINCIPAL
+    // ==========================================================
+
+    final callHasMomentum = emaBullish || macdBullish || rsiBullish;
+
+    final putHasMomentum = emaBearish || macdBearish || rsiBearish;
 
     final callReady =
         !commonBlocked &&
         !callBlocked &&
+        !rsiOverbought &&
         validCall &&
+        callHasMomentum &&
         callScore >= minimumScore &&
         callScore - putScore >= minimumMargin &&
         callConfirmations >= minimumConfirmations;
@@ -1238,32 +1446,59 @@ class TradingStrategy {
     final putReady =
         !commonBlocked &&
         !putBlocked &&
+        !rsiOversold &&
         validPut &&
+        putHasMomentum &&
         putScore >= minimumScore &&
         putScore - callScore >= minimumMargin &&
         putConfirmations >= minimumConfirmations;
 
-    // ----------------------------------------------------------
+    // ==========================================================
+    // CASO ESPECIAL:
+    //
+    // Si ambos están listos al mismo tiempo, solamente permitimos
+    // la señal si existe una diferencia bastante clara.
+    // ==========================================================
+
+    bool finalCallReady = callReady;
+    bool finalPutReady = putReady;
+
+    if (callReady && putReady) {
+      if (callScore - putScore >= 10) {
+        finalPutReady = false;
+      } else if (putScore - callScore >= 10) {
+        finalCallReady = false;
+      } else {
+        finalCallReady = false;
+        finalPutReady = false;
+      }
+    }
+
+    // ==========================================================
     // SETUP
-    // ----------------------------------------------------------
+    // ==========================================================
 
     String setup = 'MONITOREANDO';
 
-    if (callReady) {
+    if (finalCallReady) {
       if (breakoutCall) {
         setup = 'RUPTURA ALCISTA';
       } else if (reversalCall) {
         setup = 'REVERSIÓN ALCISTA';
-      } else {
+      } else if (continuationCall) {
         setup = 'CONTINUACIÓN ALCISTA';
+      } else {
+        setup = 'ENTRADA TEMPRANA ALCISTA';
       }
-    } else if (putReady) {
+    } else if (finalPutReady) {
       if (breakoutPut) {
         setup = 'RUPTURA BAJISTA';
       } else if (reversalPut) {
         setup = 'REVERSIÓN BAJISTA';
-      } else {
+      } else if (continuationPut) {
         setup = 'CONTINUACIÓN BAJISTA';
+      } else {
+        setup = 'ENTRADA TEMPRANA BAJISTA';
       }
     } else if (bullishContext && bullishTrigger) {
       setup = 'SETUP ALCISTA';
@@ -1271,15 +1506,17 @@ class TradingStrategy {
       setup = 'SETUP BAJISTA';
     }
 
-    // ----------------------------------------------------------
+    // ==========================================================
     // WAIT
-    // ----------------------------------------------------------
+    // ==========================================================
 
-    if (!callReady && !putReady) {
+    if (!finalCallReady && !finalPutReady) {
       String reason;
 
       if (indecision) {
         reason = 'Vela de indecisión';
+      } else if (deadMarket) {
+        reason = 'Mercado sin suficiente movimiento';
       } else if (overextended) {
         reason = 'Movimiento demasiado extendido';
       } else if (strongConflict) {
@@ -1288,10 +1525,16 @@ class TradingStrategy {
         reason = 'CALL bloqueado por resistencia';
       } else if (putBlocked && putScore > callScore) {
         reason = 'PUT bloqueado por soporte';
+      } else if (rsiOverbought) {
+        reason = 'RSI demasiado alto';
+      } else if (rsiOversold) {
+        reason = 'RSI demasiado bajo';
       } else if (max(callScore, putScore) < minimumScore) {
         reason = 'Falta confluencia suficiente';
+      } else if ((callScore - putScore).abs() < minimumMargin) {
+        reason = 'Ventaja insuficiente entre direcciones';
       } else {
-        reason = 'Esperando ventaja clara';
+        reason = 'Esperando confirmación de entrada';
       }
 
       final trend = callScore > putScore
@@ -1304,9 +1547,9 @@ class TradingStrategy {
           ? 'HH + HL'
           : bearishStructure
           ? 'LH + LL'
-          : bullishBos
+          : bullishBos || recentBullishBreak
           ? 'BOS ↑'
-          : bearishBos
+          : bearishBos || recentBearishBreak
           ? 'BOS ↓'
           : 'LATERAL';
 
@@ -1353,11 +1596,11 @@ class TradingStrategy {
       );
     }
 
-    // ----------------------------------------------------------
-    // SEÑAL
-    // ----------------------------------------------------------
+    // ==========================================================
+    // SEÑAL FINAL
+    // ==========================================================
 
-    final isCall = callReady;
+    final isCall = finalCallReady;
 
     final finalScore = (isCall ? callScore : putScore).round().clamp(0, 100);
 
@@ -1380,6 +1623,10 @@ class TradingStrategy {
 
       if (bullishBos) {
         reasons.add('BOS alcista');
+      }
+
+      if (recentBullishBreak) {
+        reasons.add('Ruptura reciente alcista');
       }
 
       if (bullishChoch) {
@@ -1406,6 +1653,18 @@ class TradingStrategy {
         reasons.add('Desplazamiento alcista');
       }
 
+      if (emaBullish) {
+        reasons.add('EMA20 sobre EMA50');
+      }
+
+      if (macdBullish) {
+        reasons.add('MACD alcista');
+      }
+
+      if (rsiBullish) {
+        reasons.add('RSI favorable');
+      }
+
       if (nearSupport) {
         reasons.add('Precio cerca de soporte');
       }
@@ -1424,6 +1683,10 @@ class TradingStrategy {
 
       if (bearishBos) {
         reasons.add('BOS bajista');
+      }
+
+      if (recentBearishBreak) {
+        reasons.add('Ruptura reciente bajista');
       }
 
       if (bearishChoch) {
@@ -1448,6 +1711,18 @@ class TradingStrategy {
 
       if (bearishDisplacement) {
         reasons.add('Desplazamiento bajista');
+      }
+
+      if (emaBearish) {
+        reasons.add('EMA20 bajo EMA50');
+      }
+
+      if (macdBearish) {
+        reasons.add('MACD bajista');
+      }
+
+      if (rsiBearish) {
+        reasons.add('RSI favorable');
       }
 
       if (nearResistance) {
@@ -1485,18 +1760,24 @@ class TradingStrategy {
           ? 'ALCISTA'
           : bearishStructure
           ? 'BAJISTA'
-          : 'NEUTRAL',
+          : isCall
+          ? 'ALCISTA'
+          : 'BAJISTA',
       structure: isCall
           ? bullishStructure
                 ? 'HH + HL'
-                : bullishBos
+                : bullishBos || recentBullishBreak
                 ? 'BOS ↑'
-                : 'REVERSIÓN'
+                : reversalCall
+                ? 'REVERSIÓN'
+                : 'ENTRADA TEMPRANA'
           : bearishStructure
           ? 'LH + LL'
-          : bearishBos
+          : bearishBos || recentBearishBreak
           ? 'BOS ↓'
-          : 'REVERSIÓN',
+          : reversalPut
+          ? 'REVERSIÓN'
+          : 'ENTRADA TEMPRANA',
       priceAction: isCall ? 'CONFIRMACIÓN ALCISTA' : 'CONFIRMACIÓN BAJISTA',
       levelStatus: isCall
           ? nearSupport
@@ -1613,7 +1894,6 @@ class _TradingHomePageState extends State<TradingHomePage> {
   // ==========================================================
 
   String selectedAsset = 'EUR/USD';
-
   String selectedTimeframe = '1m';
 
   List<Candle> candles = [];
@@ -1625,19 +1905,15 @@ class _TradingHomePageState extends State<TradingHomePage> {
   String? errorMessage;
 
   bool isAnalyzing = false;
-
   bool isLive = false;
 
   HubConnection? hubConnection;
 
   Timer? priceTimer;
-
   Timer? analysisTimer;
-
   Timer? countdownTimer;
 
   DateTime? signalCandleTime;
-
   DateTime? signalGeneratedAt;
 
   int entryCountdown = 0;
@@ -1764,9 +2040,7 @@ class _TradingHomePageState extends State<TradingHomePage> {
         final map = Map<String, dynamic>.from(raw);
 
         final mid = _readNumber(map['mid']);
-
         final bid = _readNumber(map['bid']);
-
         final ask = _readNumber(map['ask']);
 
         price =
@@ -1944,11 +2218,8 @@ class _TradingHomePageState extends State<TradingHomePage> {
 
       setState(() {
         candles = downloaded;
-
         currentPrice = latestPrice;
-
         isLive = true;
-
         isAnalyzing = false;
       });
 
@@ -2021,7 +2292,6 @@ class _TradingHomePageState extends State<TradingHomePage> {
       }
 
       signalCandleTime = triggerTime;
-
       signalGeneratedAt = DateTime.now();
 
       _startEntryCountdown(result);
@@ -2041,7 +2311,7 @@ class _TradingHomePageState extends State<TradingHomePage> {
   }
 
   // ==========================================================
-  // MANUAL ANALYZE BUTTON
+  // MANUAL ANALYZE
   // ==========================================================
 
   Future<void> _manualAnalyze() async {
@@ -2139,23 +2409,14 @@ class _TradingHomePageState extends State<TradingHomePage> {
 
     setState(() {
       selectedAsset = value;
-
       candles = [];
-
       signal = null;
-
       errorMessage = null;
-
       currentPrice = 0;
-
       entryCountdown = 0;
-
       entryReady = false;
-
       signalCandleTime = null;
-
       signalGeneratedAt = null;
-
       isAnalyzing = true;
     });
 
@@ -2177,21 +2438,13 @@ class _TradingHomePageState extends State<TradingHomePage> {
 
     setState(() {
       selectedTimeframe = value;
-
       candles = [];
-
       signal = null;
-
       errorMessage = null;
-
       entryCountdown = 0;
-
       entryReady = false;
-
       signalCandleTime = null;
-
       signalGeneratedAt = null;
-
       isAnalyzing = true;
     });
 
@@ -2548,9 +2801,7 @@ class _TradingHomePageState extends State<TradingHomePage> {
     final s = signal;
 
     final isCall = s?.action == 'CALL';
-
     final isPut = s?.action == 'PUT';
-
     final isWait = !isCall && !isPut;
 
     final color = isCall
@@ -2838,7 +3089,7 @@ class _TradingHomePageState extends State<TradingHomePage> {
         ),
         _metricCard(
           'CONFIRMACIONES',
-          '${s?.confirmations ?? 0}/4',
+          '${s?.confirmations ?? 0}/5',
           Icons.verified_rounded,
           const Color(0xFF31D391),
         ),
@@ -2952,7 +3203,7 @@ class _TradingHomePageState extends State<TradingHomePage> {
               spacing: 7,
               runSpacing: 7,
               children: s.reasons
-                  .take(8)
+                  .take(10)
                   .map((reason) => _reasonChip(reason))
                   .toList(),
             ),
@@ -3118,7 +3369,7 @@ class _TradingHomePageState extends State<TradingHomePage> {
         children: [
           _engineRow(
             'Motor principal',
-            'Price Action',
+            'Price Action + Confluencia',
             Icons.candlestick_chart,
           ),
           _engineRow(
@@ -3126,15 +3377,20 @@ class _TradingHomePageState extends State<TradingHomePage> {
             'HH/HL · LH/LL · BOS · CHoCH',
             Icons.account_tree,
           ),
-          _engineRow('Liquidez', 'Sweep · Retest', Icons.water_drop_outlined),
+          _engineRow(
+            'Liquidez',
+            'Sweep · Retest · S/R',
+            Icons.water_drop_outlined,
+          ),
           _engineRow(
             'Triggers',
             'Engulfing · Rejection · Displacement',
             Icons.bolt_outlined,
           ),
+          _engineRow('Momentum', 'EMA · MACD · RSI · ADX', Icons.speed_rounded),
           _engineRow(
             'Filtros',
-            'Conflicto · Extensión · Soporte/Resistencia',
+            'Conflicto · Extensión · Indecisión',
             Icons.filter_alt_outlined,
           ),
           _engineRow('Entrada', 'Ventana de 15 segundos', Icons.timer_outlined),
