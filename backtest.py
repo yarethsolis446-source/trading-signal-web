@@ -1,832 +1,1034 @@
-# ================================================================
-# TRADING ANALYZER - BACKTEST MASIVO
-# Versión 4.1 - TWELVE DATA + DOTENV + AUTH HEADER
-# ================================================================
+# ============================================================
+# TRADING ANALYZER - BACKTESTER V6
+# ============================================================
+#
+# Características:
+# - Todos los pares
+# - Todas las temporalidades
+# - Hasta 1,000,000 velas por combinación
+# - 1M descargado UNA SOLA VEZ por par
+# - 2M construido desde 1M
+# - Caché reutilizable
+# - Reanudación automática
+# - Indicadores vectorizados con pandas/numpy
+# - Rate-limit protection
+# - CSV de resultados
+#
+# ============================================================
 
 import os
 import sys
 import time
-import math
 import argparse
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
+import requests
 from dotenv import load_dotenv
 
 
-# ================================================================
-# CARGAR .ENV
-# ================================================================
+# ============================================================
+# ENV
+# ============================================================
 
-load_dotenv(override=True)
+load_dotenv()
+
+API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+
+if not API_KEY:
+    print()
+    print("=" * 70)
+    print("ERROR: No se encontró TWELVE_DATA_API_KEY")
+    print("=" * 70)
+    print()
+    print("Crea un archivo .env con:")
+    print()
+    print("TWELVE_DATA_API_KEY=TU_API_KEY")
+    print()
+    sys.exit(1)
 
 
-# ================================================================
+# ============================================================
 # CONFIGURACIÓN
-# ================================================================
+# ============================================================
 
-BASE_URL = "https://api.twelvedata.com/time_series"
+PAIRS = [
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "USD/CHF",
+    "AUD/USD",
+    "USD/CAD",
+    "NZD/USD",
+]
 
-DATA_DIR = Path("twelve_data_cache")
-RESULTS_DIR = Path("backtest_results")
+TIMEFRAMES = [
+    "1min",
+    "2min",
+    "5min",
+    "15min",
+    "30min",
+    "1h",
+]
 
-PAYOUT = 0.90
-
-API_CHUNK = 5000
-
-REQUEST_DELAY = 0.8
-
-MAX_RETRIES = 5
-
-WARMUP = 300
-
-
-TIMEFRAMES = {
-    "1m": 1,
-    "2m": 2,
-    "5m": 5,
-    "15m": 15,
-    "30m": 30,
+TF_MINUTES = {
+    "1min": 1,
+    "2min": 2,
+    "5min": 5,
+    "15min": 15,
+    "30min": 30,
     "1h": 60,
 }
 
+DEFAULT_TARGET_BARS = 1_000_000
 
-DEFAULT_PAIRS = [
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "USDCHF",
-    "AUDUSD",
-    "USDCAD",
-    "NZDUSD",
-]
+CHUNK_SIZE = 5000
+
+PAYOUT = 0.90
+
+BREAKEVEN = 1 / (1 + PAYOUT)
+
+CACHE_DIR = Path("twelve_data_cache_v6")
+RESULTS_DIR = Path("backtest_results_v6")
+
+CACHE_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+RESULTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 
-# ================================================================
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
+SESSION = requests.Session()
+
+SESSION.headers.update({
+    "Authorization": f"apikey {API_KEY}",
+    "User-Agent": "TradingAnalyzerBacktester/6.0",
+})
+
+
+# ============================================================
 # UTILIDADES
-# ================================================================
+# ============================================================
 
-def print_line(char="=", n=90):
-    print(char * n)
+def normalize_pair(pair: str) -> str:
+    """
+    Twelve Data espera símbolos como EUR/USD.
+    """
 
-
-def normalize_symbol(symbol):
-    symbol = symbol.upper().replace("/", "").replace("-", "")
-
-    if len(symbol) != 6:
-        raise ValueError(
-            f"Símbolo inválido: {symbol}. Ejemplo: EURUSD"
-        )
-
-    return symbol[:3] + "/" + symbol[3:]
+    return pair.upper()
 
 
-def safe_float(value):
-    try:
-        return float(value)
-    except Exception:
-        return np.nan
-
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def dt_to_api(dt):
-    return dt.astimezone(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S"
+def safe_name(value: str) -> str:
+    return (
+        value
+        .replace("/", "_")
+        .replace(":", "_")
+        .replace(" ", "_")
     )
 
 
-def sleep_if_needed():
-    time.sleep(REQUEST_DELAY)
+def cache_file(
+    pair: str,
+    timeframe: str,
+) -> Path:
+
+    return (
+        CACHE_DIR /
+        f"{safe_name(pair)}_{timeframe}.csv"
+    )
 
 
-# ================================================================
-# TWELVE DATA CLIENT
-# ================================================================
+def result_file(
+    pair: str,
+    timeframe: str,
+) -> Path:
 
-class TwelveDataClient:
+    return (
+        RESULTS_DIR /
+        f"{safe_name(pair)}_{timeframe}_operations.csv"
+    )
 
-    def __init__(self, api_key):
 
-        self.api_key = api_key.strip() if api_key else ""
+def separator():
+    print("=" * 75)
 
-        if not self.api_key:
-            raise RuntimeError(
-                "\nNo se encontró TWELVE_DATA_API_KEY.\n\n"
-                "Comprueba que exista el archivo .env:\n\n"
-                "TWELVE_DATA_API_KEY=TU_API_KEY\n"
+
+# ============================================================
+# REQUEST TWELVE DATA
+# ============================================================
+
+def request_time_series(
+    pair: str,
+    timeframe: str,
+    end_date=None,
+    outputsize=CHUNK_SIZE,
+    retries=8,
+):
+
+    url = (
+        "https://api.twelvedata.com/time_series"
+    )
+
+    params = {
+        "symbol": normalize_pair(pair),
+        "interval": timeframe,
+        "outputsize": outputsize,
+        "format": "JSON",
+        "order": "ASC",
+    }
+
+    if end_date:
+        params["end_date"] = end_date
+
+    for attempt in range(retries):
+
+        try:
+
+            response = SESSION.get(
+                url,
+                params=params,
+                timeout=90,
             )
 
-        self.session = requests.Session()
+            # ------------------------------------------------
+            # OK
+            # ------------------------------------------------
 
-        self.headers = {
-            "Authorization": f"apikey {self.api_key}",
-            "User-Agent": "TradingAnalyzer-Backtest/4.1",
-        }
-
-    # ------------------------------------------------------------
-    # REQUEST
-    # ------------------------------------------------------------
-
-    def request(self, params):
-
-        params = dict(params)
-
-        last_error = None
-
-        for attempt in range(1, MAX_RETRIES + 1):
-
-            try:
-
-                response = self.session.get(
-                    BASE_URL,
-                    params=params,
-                    headers=self.headers,
-                    timeout=45,
-                )
-
-                if response.status_code != 200:
-
-                    last_error = (
-                        f"HTTP {response.status_code}: "
-                        f"{response.text[:500]}"
-                    )
-
-                    if response.status_code in (
-                        429,
-                        500,
-                        502,
-                        503,
-                        504,
-                    ):
-
-                        wait = min(
-                            10 * attempt,
-                            60,
-                        )
-
-                        print(
-                            f"\n  ⚠ Servidor/rate limit."
-                            f" Reintentando en {wait}s..."
-                        )
-
-                        time.sleep(wait)
-
-                        continue
-
-                    raise RuntimeError(last_error)
+            if response.status_code == 200:
 
                 data = response.json()
 
-                if isinstance(data, dict):
+                if "values" in data:
 
-                    if data.get("status") == "error":
+                    return data
 
-                        message = data.get(
-                            "message",
-                            "Error desconocido",
-                        )
-
-                        code = data.get(
-                            "code",
-                            "",
-                        )
-
-                        last_error = (
-                            f"Twelve Data error "
-                            f"{code}: {message}"
-                        )
-
-                        message_lower = message.lower()
-
-                        temporary = any(
-                            x in message_lower
-                            for x in [
-                                "rate",
-                                "limit",
-                                "too many",
-                                "credits",
-                                "quota",
-                            ]
-                        )
-
-                        if temporary:
-
-                            wait = min(
-                                10 * attempt,
-                                60,
-                            )
-
-                            print(
-                                f"\n  ⚠ {message}"
-                            )
-
-                            print(
-                                f"  Reintentando en {wait}s..."
-                            )
-
-                            time.sleep(wait)
-
-                            continue
-
-                        raise RuntimeError(
-                            last_error
-                        )
-
-                return data
-
-            except requests.RequestException as exc:
-
-                last_error = str(exc)
-
-                wait = min(
-                    5 * attempt,
-                    30,
+                message = data.get(
+                    "message",
+                    "Respuesta sin valores",
                 )
 
                 print(
-                    f"\n  ⚠ Error de conexión: {exc}"
+                    f"    API: {message}"
+                )
+
+                # Rate limit
+                if "rate" in message.lower():
+
+                    wait = (
+                        10 *
+                        (attempt + 1)
+                    )
+
+                    print(
+                        f"    Esperando {wait}s..."
+                    )
+
+                    time.sleep(wait)
+                    continue
+
+                return None
+
+            # ------------------------------------------------
+            # RATE LIMIT
+            # ------------------------------------------------
+
+            if response.status_code == 429:
+
+                wait = (
+                    15 *
+                    (attempt + 1)
                 )
 
                 print(
-                    f"  Reintentando en {wait}s..."
+                    f"    HTTP 429. "
+                    f"Esperando {wait}s..."
                 )
 
                 time.sleep(wait)
 
-        raise RuntimeError(
-            f"No se pudo completar la petición "
-            f"después de {MAX_RETRIES} intentos.\n"
-            f"{last_error}"
-        )
+                continue
 
-    # ------------------------------------------------------------
-    # TEST DE API
-    # ------------------------------------------------------------
+            # ------------------------------------------------
+            # 404
+            # ------------------------------------------------
 
-    def test_connection(self):
+            if response.status_code == 404:
 
-        params = {
-            "symbol": "EUR/USD",
-        }
-
-        data = self.request_price(params)
-
-        return data
-
-    def request_price(self, params):
-
-        url = "https://api.twelvedata.com/price"
-
-        response = self.session.get(
-            url,
-            params=params,
-            headers=self.headers,
-            timeout=30,
-        )
-
-        if response.status_code != 200:
-
-            raise RuntimeError(
-                f"HTTP {response.status_code}: "
-                f"{response.text[:500]}"
-            )
-
-        data = response.json()
-
-        if isinstance(data, dict):
-
-            if data.get("status") == "error":
-
-                raise RuntimeError(
-                    data.get(
-                        "message",
-                        "Error de Twelve Data",
-                    )
+                print(
+                    "    HTTP 404."
                 )
 
-        return data
+                try:
+                    error_data = (
+                        response.json()
+                    )
 
-    # ------------------------------------------------------------
-    # CHUNK 1M
-    # ------------------------------------------------------------
+                    print(
+                        "    ",
+                        error_data,
+                    )
 
-    def get_1m_chunk(
-        self,
-        symbol,
-        end_dt,
-    ):
+                except Exception:
+                    pass
 
-        params = {
-            "symbol": normalize_symbol(symbol),
-            "interval": "1min",
-            "outputsize": API_CHUNK,
-            "end_date": dt_to_api(end_dt),
-            "timezone": "UTC",
-        }
+                return None
 
-        data = self.request(params)
+            # ------------------------------------------------
+            # OTROS ERRORES
+            # ------------------------------------------------
 
-        values = data.get(
-            "values",
-            [],
-        )
-
-        if not values:
-            return pd.DataFrame()
-
-        rows = []
-
-        for item in values:
-
-            rows.append(
-                {
-                    "datetime": item.get(
-                        "datetime"
-                    ),
-                    "open": safe_float(
-                        item.get("open")
-                    ),
-                    "high": safe_float(
-                        item.get("high")
-                    ),
-                    "low": safe_float(
-                        item.get("low")
-                    ),
-                    "close": safe_float(
-                        item.get("close")
-                    ),
-                    "volume": safe_float(
-                        item.get("volume")
-                    ),
-                }
+            print(
+                f"    HTTP "
+                f"{response.status_code}"
             )
 
-        df = pd.DataFrame(rows)
+            if attempt < retries - 1:
 
-        if df.empty:
-            return df
+                time.sleep(
+                    5 *
+                    (attempt + 1)
+                )
 
-        df["datetime"] = pd.to_datetime(
-            df["datetime"],
-            utc=True,
-            errors="coerce",
-        )
+        except requests.RequestException as e:
 
-        df = df.dropna(
-            subset=["datetime"]
-        )
+            print(
+                f"    Error de conexión: {e}"
+            )
 
-        for col in [
+            if attempt < retries - 1:
+
+                wait = (
+                    5 *
+                    (attempt + 1)
+                )
+
+                time.sleep(wait)
+
+    return None
+
+
+# ============================================================
+# PARSE DATA
+# ============================================================
+
+def parse_values(values):
+
+    if not values:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(values)
+
+    if "datetime" not in df.columns:
+        return pd.DataFrame()
+
+    df["datetime"] = pd.to_datetime(
+        df["datetime"],
+        errors="coerce",
+        utc=True,
+    )
+
+    numeric_columns = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]
+
+    for column in numeric_columns:
+
+        if column in df.columns:
+
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            )
+
+    required = [
+        "datetime",
+        "open",
+        "high",
+        "low",
+        "close",
+    ]
+
+    for column in required:
+
+        if column not in df.columns:
+
+            return pd.DataFrame()
+
+    df = df.dropna(
+        subset=required
+    )
+
+    df = df[
+        [
+            "datetime",
             "open",
             "high",
             "low",
             "close",
-            "volume",
+        ]
+    ]
+
+    df = df.drop_duplicates(
+        subset=["datetime"]
+    )
+
+    df = df.sort_values(
+        "datetime"
+    )
+
+    return df.reset_index(
+        drop=True
+    )
+
+
+# ============================================================
+# LOAD CACHE
+# ============================================================
+
+def load_cache(
+    pair,
+    timeframe,
+):
+
+    path = cache_file(
+        pair,
+        timeframe,
+    )
+
+    if not path.exists():
+
+        return pd.DataFrame()
+
+    try:
+
+        df = pd.read_csv(
+            path
+        )
+
+        if df.empty:
+
+            return df
+
+        df["datetime"] = pd.to_datetime(
+            df["datetime"],
+            errors="coerce",
+            utc=True,
+        )
+
+        for column in [
+            "open",
+            "high",
+            "low",
+            "close",
         ]:
 
-            df[col] = pd.to_numeric(
-                df[col],
+            df[column] = pd.to_numeric(
+                df[column],
                 errors="coerce",
             )
 
         df = df.dropna(
             subset=[
+                "datetime",
                 "open",
                 "high",
                 "low",
                 "close",
             ]
+        )
+
+        df = df.drop_duplicates(
+            "datetime"
         )
 
         df = df.sort_values(
             "datetime"
         )
 
-        df = df.drop_duplicates(
-            subset=["datetime"],
-            keep="last",
-        )
-
         return df.reset_index(
             drop=True
         )
 
+    except Exception as e:
 
-# ================================================================
-# DESCARGA HISTÓRICA
-# ================================================================
+        print(
+            f"    Error leyendo cache: {e}"
+        )
 
-def download_1m_history(
-    client,
-    symbol,
-    required_bars,
-    force=False,
+        return pd.DataFrame()
+
+
+# ============================================================
+# SAVE CACHE
+# ============================================================
+
+def save_cache(
+    pair,
+    timeframe,
+    df,
 ):
 
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    path = cache_file(
+        pair,
+        timeframe,
     )
 
-    symbol_clean = (
-        symbol
-        .replace("/", "")
-        .upper()
+    temp_path = path.with_suffix(
+        ".tmp"
     )
 
-    cache_file = (
-        DATA_DIR
-        / f"{symbol_clean}_1m.csv"
+    df.to_csv(
+        temp_path,
+        index=False,
     )
 
-    print()
-    print("=" * 80)
+    temp_path.replace(
+        path
+    )
+
+
+# ============================================================
+# DESCARGA 1 MINUTO
+# ============================================================
+
+def download_1m(
+    pair,
+    target_bars,
+):
+
+    separator()
+
     print(
-        f"DESCARGANDO HISTÓRICO 1M: {symbol}"
+        f"{pair} | BASE 1MIN"
     )
-    print("=" * 80)
 
-    cached = pd.DataFrame()
+    # --------------------------------------------------------
+    # Cache existente
+    # --------------------------------------------------------
 
-    # ------------------------------------------------------------
-    # CACHE
-    # ------------------------------------------------------------
+    df = load_cache(
+        pair,
+        "1min",
+    )
 
-    if cache_file.exists() and not force:
-
-        print(
-            f"Cache encontrado: {cache_file}"
-        )
-
-        try:
-
-            cached = pd.read_csv(
-                cache_file,
-                parse_dates=[
-                    "datetime"
-                ],
-            )
-
-            cached["datetime"] = (
-                pd.to_datetime(
-                    cached["datetime"],
-                    utc=True,
-                    errors="coerce",
-                )
-            )
-
-            cached = cached.dropna(
-                subset=["datetime"]
-            )
-
-            cached = (
-                cached
-                .sort_values("datetime")
-                .drop_duplicates(
-                    subset=["datetime"]
-                )
-                .reset_index(drop=True)
-            )
-
-            print(
-                f"Velas en cache: "
-                f"{len(cached):,}"
-            )
-
-        except Exception as exc:
-
-            print(
-                f"⚠ Cache inválido: {exc}"
-            )
-
-            cached = pd.DataFrame()
-
-    # ------------------------------------------------------------
-    # CACHE SUFICIENTE
-    # ------------------------------------------------------------
-
-    if len(cached) >= required_bars:
+    if not df.empty:
 
         print(
-            f"✓ Cache suficiente: "
-            f"{len(cached):,} velas"
+            f"    Cache 1M: "
+            f"{len(df):,} velas"
         )
 
-        return (
-            cached
-            .tail(required_bars)
-            .reset_index(drop=True)
-        )
+    # --------------------------------------------------------
+    # Ya tenemos suficiente
+    # --------------------------------------------------------
 
-    # ------------------------------------------------------------
-    # PUNTO INICIAL
-    # ------------------------------------------------------------
-
-    if not cached.empty:
-
-        oldest_cached = (
-            cached["datetime"].min()
-        )
-
-        end_dt = (
-            oldest_cached
-            - timedelta(minutes=1)
-        )
-
-        all_parts = [cached]
+    if len(df) >= target_bars:
 
         print(
-            "Continuando desde el cache..."
+            f"    1M completo."
         )
+
+        return df
+
+    # --------------------------------------------------------
+    # Continuar desde la vela más antigua
+    # --------------------------------------------------------
+
+    if df.empty:
+
+        end_date = None
 
     else:
 
-        end_dt = utc_now()
+        oldest = df["datetime"].min()
 
-        all_parts = []
-
-        print(
-            "No existe cache. "
-            "Descarga desde el presente "
-            "hacia atrás."
+        end_date = (
+            oldest -
+            pd.Timedelta(
+                seconds=1
+            )
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S"
         )
-
-    needed = (
-        required_bars
-        - len(cached)
-    )
-
-    chunks_needed = math.ceil(
-        needed / API_CHUNK
-    )
-
-    print(
-        f"Objetivo total: "
-        f"{required_bars:,} velas"
-    )
-
-    print(
-        f"Faltan aproximadamente: "
-        f"{needed:,}"
-    )
-
-    print(
-        f"Requests aproximados: "
-        f"{chunks_needed:,}"
-    )
-
-    print()
-
-    downloaded = len(cached)
 
     request_number = 0
 
-    while downloaded < required_bars:
+    while len(df) < target_bars:
 
         request_number += 1
 
         print(
-            f"[{request_number}] "
-            f"Descargando hasta "
-            f"{end_dt.strftime('%Y-%m-%d %H:%M')} UTC..."
+            f"    Request "
+            f"#{request_number} | "
+            f"{len(df):,}/"
+            f"{target_bars:,}"
         )
 
-        df = client.get_1m_chunk(
-            symbol,
-            end_dt,
+        data = request_time_series(
+            pair=pair,
+            timeframe="1min",
+            end_date=end_date,
+            outputsize=CHUNK_SIZE,
         )
 
-        sleep_if_needed()
-
-        if df.empty:
+        if not data:
 
             print(
-                "\n⚠ Twelve Data "
-                "no devolvió más datos."
+                "    No se recibieron "
+                "más datos."
             )
 
             break
 
+        values = data.get(
+            "values",
+            []
+        )
+
+        if not values:
+
+            print(
+                "    No hay más velas."
+            )
+
+            break
+
+        chunk = parse_values(
+            values
+        )
+
+        if chunk.empty:
+
+            print(
+                "    Bloque vacío."
+            )
+
+            break
+
+        previous_length = len(df)
+
+        if df.empty:
+
+            df = chunk
+
+        else:
+
+            df = pd.concat(
+                [
+                    df,
+                    chunk,
+                ],
+                ignore_index=True,
+            )
+
+            df = df.drop_duplicates(
+                subset=["datetime"]
+            )
+
+            df = df.sort_values(
+                "datetime"
+            ).reset_index(
+                drop=True
+            )
+
+        added = (
+            len(df) -
+            previous_length
+        )
+
         print(
-            f"    Recibidas: "
+            f"    +{added:,} "
+            f"| total "
             f"{len(df):,}"
+        )
+
+        if added <= 0:
+
+            print(
+                "    No hubo datos nuevos."
+            )
+
+            break
+
+        # Guardar inmediatamente
+        save_cache(
+            pair,
+            "1min",
+            df,
+        )
+
+        # Nueva fecha de paginación
+        oldest = df["datetime"].min()
+
+        new_end_date = (
+            oldest -
+            pd.Timedelta(
+                seconds=1
+            )
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        if new_end_date == end_date:
+
+            print(
+                "    La fecha no avanzó."
+            )
+
+            break
+
+        end_date = new_end_date
+
+        # ----------------------------------------------------
+        # Pausa anti-rate-limit
+        # ----------------------------------------------------
+
+        time.sleep(
+            0.35
+        )
+
+        # ----------------------------------------------------
+        # Menos de 5000 = posiblemente fin
+        # ----------------------------------------------------
+
+        if len(values) < CHUNK_SIZE:
+
+            print(
+                "    Bloque menor de 5000."
+            )
+
+            print(
+                "    Probablemente se "
+                "alcanzó el historial "
+                "disponible."
+            )
+
+            break
+
+    df = df.sort_values(
+        "datetime"
+    ).reset_index(
+        drop=True
+    )
+
+    save_cache(
+        pair,
+        "1min",
+        df,
+    )
+
+    print(
+        f"    1M FINAL: "
+        f"{len(df):,} velas"
+    )
+
+    if len(df) < target_bars:
+
+        print(
+            f"    AVISO: objetivo "
+            f"{target_bars:,}, "
+            f"disponibles "
+            f"{len(df):,}"
+        )
+
+    return df
+
+
+# ============================================================
+# AGREGAR 2 MINUTOS
+# ============================================================
+
+def build_2m_from_1m(
+    pair,
+    df_1m,
+    target_bars,
+):
+
+    separator()
+
+    print(
+        f"{pair} | CONSTRUYENDO 2MIN DESDE 1MIN"
+    )
+
+    if df_1m.empty:
+
+        return pd.DataFrame()
+
+    df = df_1m.copy()
+
+    df = df.set_index(
+        "datetime"
+    )
+
+    result = df.resample(
+        "2min",
+        label="left",
+        closed="left",
+    ).agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+        }
+    )
+
+    result = result.dropna()
+
+    result = result.reset_index()
+
+    result = result.sort_values(
+        "datetime"
+    )
+
+    result = result.drop_duplicates(
+        "datetime"
+    )
+
+    if len(result) > target_bars:
+
+        result = result.tail(
+            target_bars
+        )
+
+    result = result.reset_index(
+        drop=True
+    )
+
+    # Guardar 2M para futuras ejecuciones
+    save_cache(
+        pair,
+        "2min",
+        result,
+    )
+
+    print(
+        f"    2M construidas: "
+        f"{len(result):,}"
+    )
+
+    return result
+
+
+# ============================================================
+# DESCARGA TIMEFRAME DIRECTO
+# ============================================================
+
+def download_direct(
+    pair,
+    timeframe,
+    target_bars,
+):
+
+    separator()
+
+    print(
+        f"{pair} | {timeframe}"
+    )
+
+    df = load_cache(
+        pair,
+        timeframe,
+    )
+
+    if not df.empty:
+
+        print(
+            f"    Cache: "
+            f"{len(df):,}"
+        )
+
+    if len(df) >= target_bars:
+
+        print(
+            "    Cache suficiente."
+        )
+
+        return df
+
+    if df.empty:
+
+        end_date = None
+
+    else:
+
+        oldest = df["datetime"].min()
+
+        end_date = (
+            oldest -
+            pd.Timedelta(
+                seconds=1
+            )
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+    request_number = 0
+
+    while len(df) < target_bars:
+
+        request_number += 1
+
+        print(
+            f"    Request "
+            f"#{request_number} | "
+            f"{len(df):,}/"
+            f"{target_bars:,}"
+        )
+
+        data = request_time_series(
+            pair=pair,
+            timeframe=timeframe,
+            end_date=end_date,
+            outputsize=CHUNK_SIZE,
+        )
+
+        if not data:
+
+            print(
+                "    Fin de datos."
+            )
+
+            break
+
+        values = data.get(
+            "values",
+            []
+        )
+
+        if not values:
+
+            print(
+                "    No hay más datos."
+            )
+
+            break
+
+        chunk = parse_values(
+            values
+        )
+
+        if chunk.empty:
+
+            break
+
+        previous_length = len(df)
+
+        if df.empty:
+
+            df = chunk
+
+        else:
+
+            df = pd.concat(
+                [
+                    df,
+                    chunk,
+                ],
+                ignore_index=True,
+            )
+
+            df = df.drop_duplicates(
+                "datetime"
+            )
+
+            df = df.sort_values(
+                "datetime"
+            ).reset_index(
+                drop=True
+            )
+
+        added = (
+            len(df) -
+            previous_length
+        )
+
+        print(
+            f"    +{added:,} "
+            f"| total "
+            f"{len(df):,}"
+        )
+
+        if added <= 0:
+
+            break
+
+        save_cache(
+            pair,
+            timeframe,
+            df,
         )
 
         oldest = df["datetime"].min()
 
-        newest = df["datetime"].max()
-
-        print(
-            f"    Rango: "
-            f"{oldest} -> {newest}"
-        )
-
-        all_parts.append(df)
-
-        combined_temp = pd.concat(
-            all_parts,
-            ignore_index=True,
-        )
-
-        combined_temp = (
-            combined_temp
-            .drop_duplicates(
-                subset=["datetime"],
-                keep="last",
+        new_end_date = (
+            oldest -
+            pd.Timedelta(
+                seconds=1
             )
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S"
         )
 
-        combined_temp = (
-            combined_temp
-            .sort_values("datetime")
-            .reset_index(drop=True)
+        if new_end_date == end_date:
+
+            break
+
+        end_date = new_end_date
+
+        time.sleep(
+            0.35
         )
 
-        downloaded = len(
-            combined_temp
-        )
-
-        print(
-            f"    Total acumulado: "
-            f"{downloaded:,}/"
-            f"{required_bars:,}"
-        )
-
-        # --------------------------------------------------------
-        # SEGURIDAD CONTRA LOOP
-        # --------------------------------------------------------
-
-        if oldest >= end_dt:
+        if len(values) < CHUNK_SIZE:
 
             print(
-                "⚠ La API no retrocedió. "
-                "Se detiene."
+                "    Se alcanzó "
+                "probablemente el "
+                "historial disponible."
             )
 
             break
 
-        end_dt = (
-            oldest
-            - timedelta(minutes=1)
-        )
-
-        # --------------------------------------------------------
-        # CACHE PARCIAL
-        # --------------------------------------------------------
-
-        try:
-
-            combined_temp.to_csv(
-                cache_file,
-                index=False,
-            )
-
-            print(
-                "    ✓ Cache actualizado"
-            )
-
-        except Exception as exc:
-
-            print(
-                f"    ⚠ No se pudo guardar "
-                f"cache: {exc}"
-            )
-
-        print()
-
-    # ------------------------------------------------------------
-    # COMBINAR
-    # ------------------------------------------------------------
-
-    if not all_parts:
-
-        raise RuntimeError(
-            f"No se pudieron descargar "
-            f"datos para {symbol}."
-        )
-
-    df = pd.concat(
-        all_parts,
-        ignore_index=True,
-    )
-
-    df = (
-        df
-        .drop_duplicates(
-            subset=["datetime"],
-            keep="last",
-        )
-        .sort_values("datetime")
-        .reset_index(drop=True)
-    )
-
-    # ------------------------------------------------------------
-    # GUARDAR
-    # ------------------------------------------------------------
-
-    df.to_csv(
-        cache_file,
-        index=False,
-    )
-
-    print()
-    print(
-        f"✓ HISTÓRICO FINAL: "
-        f"{len(df):,} velas 1M"
-    )
-
-    print(
-        f"Primer dato: "
-        f"{df['datetime'].min()}"
-    )
-
-    print(
-        f"Último dato:  "
-        f"{df['datetime'].max()}"
-    )
-
-    if len(df) < required_bars:
-
-        print()
-
-        print(
-            f"⚠ ATENCIÓN: se solicitaron "
-            f"{required_bars:,} velas, "
-            f"pero solo hay "
-            f"{len(df):,}."
-        )
-
-    return (
-        df
-        .tail(required_bars)
-        .reset_index(drop=True)
-    )
-
-
-# ================================================================
-# AGREGACIÓN
-# ================================================================
-
-def aggregate_minutes(
-    df,
-    minutes,
-):
-
-    if minutes == 1:
-
-        return (
-            df.copy()
-            .reset_index(drop=True)
-        )
-
-    x = df.copy()
-
-    x = x.set_index(
+    df = df.sort_values(
         "datetime"
+    ).reset_index(
+        drop=True
     )
 
-    rule = f"{minutes}min"
-
-    agg = (
-        x.resample(
-            rule,
-            label="left",
-            closed="left",
-        )
-        .agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
-        )
-        .dropna(
-            subset=[
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        )
-        .reset_index()
+    save_cache(
+        pair,
+        timeframe,
+        df,
     )
 
-    return agg
+    print(
+        f"    FINAL {timeframe}: "
+        f"{len(df):,}"
+    )
+
+    return df
 
 
-# ================================================================
-# INDICADORES
-# ================================================================
+# ============================================================
+# EMA
+# ============================================================
 
-def ema(
+def calculate_ema(
     series,
     period,
 ):
@@ -838,24 +1040,16 @@ def ema(
     ).mean()
 
 
-def rma(
-    series,
-    period,
-):
+# ============================================================
+# RSI
+# ============================================================
 
-    return series.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-
-def rsi(
-    series,
+def calculate_rsi(
+    close,
     period=14,
 ):
 
-    delta = series.diff()
+    delta = close.diff()
 
     gain = delta.clip(
         lower=0
@@ -865,88 +1059,40 @@ def rsi(
         upper=0
     )
 
-    avg_gain = rma(
-        gain,
-        period,
-    )
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
 
-    avg_loss = rma(
-        loss,
-        period,
-    )
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
 
     rs = (
-        avg_gain
-        / avg_loss.replace(
+        avg_gain /
+        avg_loss.replace(
             0,
             np.nan,
         )
     )
 
-    result = (
-        100
-        - (
-            100
-            / (1 + rs)
+    return (
+        100 -
+        (
+            100 /
+            (1 + rs)
         )
     )
 
-    result = result.where(
-        avg_loss != 0,
-        100,
-    )
 
-    result = result.where(
-        avg_gain != 0,
-        0,
-    )
+# ============================================================
+# ATR
+# ============================================================
 
-    both_zero = (
-        (avg_gain == 0)
-        & (avg_loss == 0)
-    )
-
-    result = result.where(
-        ~both_zero,
-        50,
-    )
-
-    return result
-
-
-def macd(series):
-
-    fast = ema(
-        series,
-        12,
-    )
-
-    slow = ema(
-        series,
-        26,
-    )
-
-    macd_line = (
-        fast - slow
-    )
-
-    signal = ema(
-        macd_line,
-        9,
-    )
-
-    histogram = (
-        macd_line - signal
-    )
-
-    return (
-        macd_line,
-        signal,
-        histogram,
-    )
-
-
-def atr(
+def calculate_atr(
     df,
     period=14,
 ):
@@ -959,32 +1105,33 @@ def atr(
 
     previous_close = close.shift(1)
 
-    tr1 = high - low
-
-    tr2 = (
-        high - previous_close
-    ).abs()
-
-    tr3 = (
-        low - previous_close
-    ).abs()
-
     tr = pd.concat(
         [
-            tr1,
-            tr2,
-            tr3,
+            high - low,
+            (
+                high -
+                previous_close
+            ).abs(),
+            (
+                low -
+                previous_close
+            ).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    return rma(
-        tr,
-        period,
-    )
+    return tr.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
 
 
-def adx(
+# ============================================================
+# ADX
+# ============================================================
+
+def calculate_adx(
     df,
     period=14,
 ):
@@ -999,136 +1146,177 @@ def adx(
 
     down_move = -low.diff()
 
-    plus_dm = pd.Series(
-        np.where(
-            (
-                (up_move > down_move)
-                & (up_move > 0)
-            ),
-            up_move,
-            0.0,
+    plus_dm = np.where(
+        (
+            up_move >
+            down_move
+        ) &
+        (
+            up_move > 0
         ),
-        index=df.index,
+        up_move,
+        0.0,
     )
 
-    minus_dm = pd.Series(
-        np.where(
-            (
-                (down_move > up_move)
-                & (down_move > 0)
-            ),
-            down_move,
-            0.0,
+    minus_dm = np.where(
+        (
+            down_move >
+            up_move
+        ) &
+        (
+            down_move > 0
         ),
-        index=df.index,
+        down_move,
+        0.0,
     )
 
-    prev_close = close.shift(1)
+    previous_close = close.shift(1)
 
     tr = pd.concat(
         [
             high - low,
             (
-                high - prev_close
+                high -
+                previous_close
             ).abs(),
             (
-                low - prev_close
+                low -
+                previous_close
             ).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    atr_value = rma(
-        tr,
-        period,
+    atr = tr.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    plus_dm = pd.Series(
+        plus_dm,
+        index=df.index,
+    )
+
+    minus_dm = pd.Series(
+        minus_dm,
+        index=df.index,
     )
 
     plus_di = (
-        100
-        * rma(
-            plus_dm,
-            period,
-        )
-        / atr_value
+        100 *
+        plus_dm.ewm(
+            alpha=1 / period,
+            adjust=False,
+            min_periods=period,
+        ).mean() /
+        atr
     )
 
     minus_di = (
-        100
-        * rma(
-            minus_dm,
-            period,
-        )
-        / atr_value
+        100 *
+        minus_dm.ewm(
+            alpha=1 / period,
+            adjust=False,
+            min_periods=period,
+        ).mean() /
+        atr
     )
 
     denominator = (
-        plus_di + minus_di
+        plus_di +
+        minus_di
     ).replace(
         0,
         np.nan,
     )
 
     dx = (
-        100
-        * (
-            plus_di
-            - minus_di
-        ).abs()
-        / denominator
+        100 *
+        (
+            plus_di -
+            minus_di
+        ).abs() /
+        denominator
     )
 
-    return rma(
-        dx,
-        period,
-    )
+    return dx.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
 
 
-# ================================================================
-# INDICADORES COMPLETOS
-# ================================================================
+# ============================================================
+# INDICADORES
+# ============================================================
 
-def calculate_indicators(df):
+def calculate_indicators(
+    df,
+):
 
     df = df.copy()
 
     close = df["close"]
 
-    df["ema20"] = ema(
+    df["ema20"] = calculate_ema(
         close,
         20,
     )
 
-    df["ema50"] = ema(
+    df["ema50"] = calculate_ema(
         close,
         50,
     )
 
     df["ema20_prev"] = (
-        df["ema20"].shift(3)
+        df["ema20"]
+        .shift(3)
     )
 
     df["ema_slope"] = (
-        df["ema20"]
-        - df["ema20_prev"]
+        df["ema20"] -
+        df["ema20_prev"]
     )
 
-    df["rsi"] = rsi(
+    df["rsi"] = calculate_rsi(
         close,
         14,
     )
 
-    (
-        df["macd"],
-        df["macd_signal"],
-        df["macd_hist"],
-    ) = macd(close)
+    ema12 = calculate_ema(
+        close,
+        12,
+    )
 
-    df["adx"] = adx(
+    ema26 = calculate_ema(
+        close,
+        26,
+    )
+
+    df["macd"] = (
+        ema12 -
+        ema26
+    )
+
+    df["macd_signal"] = (
+        calculate_ema(
+            df["macd"],
+            9,
+        )
+    )
+
+    df["macd_hist"] = (
+        df["macd"] -
+        df["macd_signal"]
+    )
+
+    df["atr"] = calculate_atr(
         df,
         14,
     )
 
-    df["atr"] = atr(
+    df["adx"] = calculate_adx(
         df,
         14,
     )
@@ -1136,2241 +1324,1649 @@ def calculate_indicators(df):
     return df
 
 
-# ================================================================
+# ============================================================
 # PRICE ACTION
-# ================================================================
+# ============================================================
 
-def candle_body_ratio(row):
-
-    candle_range = (
-        row["high"]
-        - row["low"]
-    )
-
-    if candle_range <= 0:
-
-        return 0.0
-
-    return abs(
-        row["close"]
-        - row["open"]
-    ) / candle_range
-
-
-def is_bullish(row):
-
-    return (
-        row["close"]
-        > row["open"]
-    )
-
-
-def is_bearish(row):
-
-    return (
-        row["close"]
-        < row["open"]
-    )
-
-
-def bullish_engulfing(
-    prev,
-    cur,
+def calculate_price_action(
+    df,
 ):
-
-    return (
-        is_bearish(prev)
-        and is_bullish(cur)
-        and cur["open"]
-        <= prev["close"]
-        and cur["close"]
-        >= prev["open"]
-    )
-
-
-def bearish_engulfing(
-    prev,
-    cur,
-):
-
-    return (
-        is_bullish(prev)
-        and is_bearish(cur)
-        and cur["open"]
-        >= prev["close"]
-        and cur["close"]
-        <= prev["open"]
-    )
-
-
-def bullish_rejection(row):
-
-    body = abs(
-        row["close"]
-        - row["open"]
-    )
-
-    lower_wick = (
-        min(
-            row["open"],
-            row["close"],
-        )
-        - row["low"]
-    )
-
-    upper_wick = (
-        row["high"]
-        - max(
-            row["open"],
-            row["close"],
-        )
-    )
-
-    return (
-        lower_wick > body * 1.5
-        and lower_wick > upper_wick
-    )
-
-
-def bearish_rejection(row):
-
-    body = abs(
-        row["close"]
-        - row["open"]
-    )
-
-    upper_wick = (
-        row["high"]
-        - max(
-            row["open"],
-            row["close"],
-        )
-    )
-
-    lower_wick = (
-        min(
-            row["open"],
-            row["close"],
-        )
-        - row["low"]
-    )
-
-    return (
-        upper_wick > body * 1.5
-        and upper_wick > lower_wick
-    )
-
-
-# ================================================================
-# ESTRUCTURA
-# ================================================================
-
-def calculate_structure(df):
 
     df = df.copy()
 
-    n = len(df)
+    high = df["high"]
 
-    structure = [
-        "NEUTRAL"
-    ] * n
+    low = df["low"]
 
-    bos = [
-        False
-    ] * n
+    close = df["close"]
 
-    choch = [
-        False
-    ] * n
+    open_ = df["open"]
 
-    swing_high = np.full(
-        n,
-        np.nan,
+    # --------------------------------------------------------
+    # Estructura
+    # --------------------------------------------------------
+
+    previous_high = (
+        high
+        .shift(1)
+        .rolling(
+            5,
+            min_periods=5,
+        )
+        .max()
     )
 
-    swing_low = np.full(
-        n,
-        np.nan,
+    previous_low = (
+        low
+        .shift(1)
+        .rolling(
+            5,
+            min_periods=5,
+        )
+        .min()
     )
 
-    # ------------------------------------------------------------
-    # SWINGS
-    # ------------------------------------------------------------
-
-    for i in range(
-        2,
-        n - 2,
-    ):
-
-        h = df["high"].iloc[i]
-
-        l = df["low"].iloc[i]
-
-        left_h = max(
-            df["high"].iloc[i - 2],
-            df["high"].iloc[i - 1],
-        )
-
-        right_h = max(
-            df["high"].iloc[i + 1],
-            df["high"].iloc[i + 2],
-        )
-
-        left_l = min(
-            df["low"].iloc[i - 2],
-            df["low"].iloc[i - 1],
-        )
-
-        right_l = min(
-            df["low"].iloc[i + 1],
-            df["low"].iloc[i + 2],
-        )
-
-        if (
-            h > left_h
-            and h > right_h
-        ):
-
-            swing_high[i] = h
-
-        if (
-            l < left_l
-            and l < right_l
-        ):
-
-            swing_low[i] = l
-
-    # ------------------------------------------------------------
-    # ESTRUCTURA
-    # ------------------------------------------------------------
-
-    last_high = np.nan
-
-    last_low = np.nan
-
-    previous_structure = "NEUTRAL"
-
-    for i in range(n):
-
-        if not np.isnan(
-            swing_high[i]
-        ):
-
-            last_high = (
-                swing_high[i]
-            )
-
-        if not np.isnan(
-            swing_low[i]
-        ):
-
-            last_low = (
-                swing_low[i]
-            )
-
-        close = (
-            df["close"].iloc[i]
-        )
-
-        if (
-            not np.isnan(last_high)
-            and not np.isnan(last_low)
-        ):
-
-            if close > last_high:
-
-                structure[i] = "BULLISH"
-
-                bos[i] = True
-
-                if (
-                    previous_structure
-                    == "BEARISH"
-                ):
-
-                    choch[i] = True
-
-            elif close < last_low:
-
-                structure[i] = "BEARISH"
-
-                bos[i] = True
-
-                if (
-                    previous_structure
-                    == "BULLISH"
-                ):
-
-                    choch[i] = True
-
-            else:
-
-                structure[i] = (
-                    previous_structure
-                )
-
-        previous_structure = (
-            structure[i]
-        )
-
-    df["structure"] = structure
-
-    df["bos"] = bos
-
-    df["choch"] = choch
-
-    return df
-
-
-# ================================================================
-# PRICE ACTION COMPLETO
-# ================================================================
-
-def calculate_price_action(df):
-
-    df = calculate_structure(df)
-
-    n = len(df)
-
-    df["engulfing"] = False
-    df["rejection"] = False
-    df["impulse"] = False
-    df["pullback"] = False
-    df["body_ratio"] = 0.0
-
-    body_col = df.columns.get_loc(
-        "body_ratio"
+    df["HH"] = (
+        high >
+        previous_high
     )
 
-    engulf_col = df.columns.get_loc(
-        "engulfing"
+    df["LL"] = (
+        low <
+        previous_low
     )
 
-    rejection_col = df.columns.get_loc(
-        "rejection"
-    )
-
-    impulse_col = df.columns.get_loc(
-        "impulse"
-    )
-
-    pullback_col = df.columns.get_loc(
-        "pullback"
-    )
-
-    for i in range(
-        1,
-        n,
-    ):
-
-        prev = df.iloc[
-            i - 1
-        ]
-
-        cur = df.iloc[i]
-
-        ratio = candle_body_ratio(
-            cur
-        )
-
-        engulf = (
-            bullish_engulfing(
-                prev,
-                cur,
-            )
-            or bearish_engulfing(
-                prev,
-                cur,
-            )
-        )
-
-        rejection = (
-            bullish_rejection(cur)
-            or bearish_rejection(cur)
-        )
-
-        impulse = False
-
-        if not pd.isna(
-            cur["atr"]
-        ):
-
-            candle_range = (
-                cur["high"]
-                - cur["low"]
-            )
-
-            impulse = (
-                ratio >= 0.60
-                and candle_range
-                >= cur["atr"] * 1.0
-            )
-
-        # --------------------------------------------------------
-        # PULLBACK
-        # --------------------------------------------------------
-
-        pullback = False
-
-        if (
-            not pd.isna(
-                cur["ema20"]
-            )
-            and not pd.isna(
-                cur["atr"]
-            )
-            and cur["atr"] > 0
-        ):
-
-            distance = abs(
-                cur["close"]
-                - cur["ema20"]
-            )
-
-            near_ema = (
-                distance
-                <= cur["atr"] * 0.50
-            )
-
-            bullish_pb = (
-                cur["structure"]
-                == "BULLISH"
-                and is_bullish(cur)
-            )
-
-            bearish_pb = (
-                cur["structure"]
-                == "BEARISH"
-                and is_bearish(cur)
-            )
-
-            pullback = (
-                near_ema
-                and (
-                    bullish_pb
-                    or bearish_pb
-                )
-            )
-
-        df.iloc[
-            i,
-            body_col,
-        ] = ratio
-
-        df.iloc[
-            i,
-            engulf_col,
-        ] = engulf
-
-        df.iloc[
-            i,
-            rejection_col,
-        ] = rejection
-
-        df.iloc[
-            i,
-            impulse_col,
-        ] = impulse
-
-        df.iloc[
-            i,
-            pullback_col,
-        ] = pullback
-
-    return df
-
-
-# ================================================================
-# SOPORTE / RESISTENCIA
-# ================================================================
-
-def nearest_levels(
-    df,
-    index,
-):
-
-    row = df.iloc[index]
-
-    price = row["close"]
-
-    atr_value = row["atr"]
-
-    if (
-        pd.isna(atr_value)
-        or atr_value <= 0
-    ):
-
-        return (
-            np.nan,
-            np.nan,
-        )
-
-    start = max(
-        0,
-        index - 100,
-    )
-
-    history = df.iloc[
-        start:index
-    ]
-
-    if history.empty:
-
-        return (
-            np.nan,
-            np.nan,
-        )
-
-    resistance = (
-        history["high"].max()
-    )
-
-    support = (
-        history["low"].min()
-    )
-
-    return (
-        support,
-        resistance,
-    )
-
-
-# ================================================================
-# GENERADOR DE SEÑAL
-# ================================================================
-
-def generate_signal(
-    df,
-    i,
-):
-
-    if i < 60:
-
-        return None
-
-    row = df.iloc[i]
-
-    required = [
-        "ema20",
-        "ema50",
-        "rsi",
-        "macd",
-        "macd_signal",
-        "macd_hist",
-        "adx",
-        "atr",
-    ]
-
-    for col in required:
-
-        if pd.isna(row[col]):
-
-            return None
-
-    bull_score = 0.0
-
-    bear_score = 0.0
-
-    reasons_bull = []
-
-    reasons_bear = []
-
-    # ------------------------------------------------------------
-    # EMA TREND
-    # ------------------------------------------------------------
-
-    if row["ema20"] > row["ema50"]:
-
-        bull_score += 2
-
-        reasons_bull.append(
-            "EMA20 > EMA50"
-        )
-
-    elif row["ema20"] < row["ema50"]:
-
-        bear_score += 2
-
-        reasons_bear.append(
-            "EMA20 < EMA50"
-        )
-
-    # ------------------------------------------------------------
-    # EMA SLOPE
-    # ------------------------------------------------------------
-
-    if row["ema_slope"] > 0:
-
-        bull_score += 1
-
-        reasons_bull.append(
-            "Pendiente EMA20 alcista"
-        )
-
-    elif row["ema_slope"] < 0:
-
-        bear_score += 1
-
-        reasons_bear.append(
-            "Pendiente EMA20 bajista"
-        )
-
-    # ------------------------------------------------------------
-    # RSI
-    # ------------------------------------------------------------
-
-    r = row["rsi"]
-
-    if 52 <= r <= 68:
-
-        bull_score += 1
-
-        reasons_bull.append(
-            f"RSI alcista ({r:.1f})"
-        )
-
-    elif 32 <= r <= 48:
-
-        bear_score += 1
-
-        reasons_bear.append(
-            f"RSI bajista ({r:.1f})"
-        )
-
-    if r > 75:
-
-        bull_score -= 0.75
-
-    if r < 25:
-
-        bear_score -= 0.75
-
-    # ------------------------------------------------------------
-    # MACD
-    # ------------------------------------------------------------
-
-    if (
-        row["macd"]
-        > row["macd_signal"]
-    ):
-
-        bull_score += 1
-
-        reasons_bull.append(
-            "MACD alcista"
-        )
-
-    elif (
-        row["macd"]
-        < row["macd_signal"]
-    ):
-
-        bear_score += 1
-
-        reasons_bear.append(
-            "MACD bajista"
-        )
-
-    if row["macd_hist"] > 0:
-
-        bull_score += 0.5
-
-    elif row["macd_hist"] < 0:
-
-        bear_score += 0.5
-
-    # ------------------------------------------------------------
-    # ADX
-    # ------------------------------------------------------------
-
-    adx_value = row["adx"]
-
-    if adx_value >= 20:
-
-        if bull_score > bear_score:
-
-            bull_score += 1
-
-            reasons_bull.append(
-                f"ADX fuerte ({adx_value:.1f})"
-            )
-
-        elif bear_score > bull_score:
-
-            bear_score += 1
-
-            reasons_bear.append(
-                f"ADX fuerte ({adx_value:.1f})"
-            )
-
-    else:
-
-        bull_score -= 0.25
-
-        bear_score -= 0.25
-
-    # ------------------------------------------------------------
-    # ESTRUCTURA
-    # ------------------------------------------------------------
-
-    structure = row["structure"]
-
-    if structure == "BULLISH":
-
-        bull_score += 2
-
-        reasons_bull.append(
-            "Estructura HH + HL"
-        )
-
-    elif structure == "BEARISH":
-
-        bear_score += 2
-
-        reasons_bear.append(
-            "Estructura LH + LL"
-        )
-
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
     # BOS
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
 
-    if bool(row["bos"]):
+    recent_high = (
+        high
+        .shift(1)
+        .rolling(
+            10,
+            min_periods=10,
+        )
+        .max()
+    )
 
-        if structure == "BULLISH":
+    recent_low = (
+        low
+        .shift(1)
+        .rolling(
+            10,
+            min_periods=10,
+        )
+        .min()
+    )
 
-            bull_score += 2.5
+    df["BOS_BULL"] = (
+        close >
+        recent_high
+    )
 
-            reasons_bull.append(
-                "BOS alcista"
-            )
+    df["BOS_BEAR"] = (
+        close <
+        recent_low
+    )
 
-        elif structure == "BEARISH":
-
-            bear_score += 2.5
-
-            reasons_bear.append(
-                "BOS bajista"
-            )
-
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
     # CHOCH
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
 
-    if bool(row["choch"]):
-
-        if structure == "BULLISH":
-
-            bull_score += 2
-
-            reasons_bull.append(
-                "CHOCH alcista"
-            )
-
-        elif structure == "BEARISH":
-
-            bear_score += 2
-
-            reasons_bear.append(
-                "CHOCH bajista"
-            )
-
-    # ------------------------------------------------------------
-    # ENGULFING
-    # ------------------------------------------------------------
-
-    if bool(row["engulfing"]):
-
-        if is_bullish(row):
-
-            bull_score += 2
-
-            reasons_bull.append(
-                "Engulfing alcista"
-            )
-
-        elif is_bearish(row):
-
-            bear_score += 2
-
-            reasons_bear.append(
-                "Engulfing bajista"
-            )
-
-    # ------------------------------------------------------------
-    # RECHAZO
-    # ------------------------------------------------------------
-
-    if bool(row["rejection"]):
-
-        if is_bullish(row):
-
-            bull_score += 1.5
-
-            reasons_bull.append(
-                "Rechazo alcista"
-            )
-
-        elif is_bearish(row):
-
-            bear_score += 1.5
-
-            reasons_bear.append(
-                "Rechazo bajista"
-            )
-
-    # ------------------------------------------------------------
-    # IMPULSO
-    # ------------------------------------------------------------
-
-    if bool(row["impulse"]):
-
-        if is_bullish(row):
-
-            bull_score += 1
-
-            reasons_bull.append(
-                "Impulso alcista"
-            )
-
-        elif is_bearish(row):
-
-            bear_score += 1
-
-            reasons_bear.append(
-                "Impulso bajista"
-            )
-
-    # ------------------------------------------------------------
-    # PULLBACK
-    # ------------------------------------------------------------
-
-    if bool(row["pullback"]):
-
-        if structure == "BULLISH":
-
-            bull_score += 1.5
-
-            reasons_bull.append(
-                "Pullback alcista"
-            )
-
-        elif structure == "BEARISH":
-
-            bear_score += 1.5
-
-            reasons_bear.append(
-                "Pullback bajista"
-            )
-
-    # ------------------------------------------------------------
-    # SOPORTE / RESISTENCIA
-    # ------------------------------------------------------------
-
-    support, resistance = nearest_levels(
-        df,
-        i,
+    previous_bull = (
+        df["ema20"]
+        .shift(1) >
+        df["ema50"]
+        .shift(1)
     )
 
-    support_too_close = False
-
-    resistance_too_close = False
-
-    if not pd.isna(support):
-
-        support_too_close = (
-            abs(
-                row["close"]
-                - support
-            )
-            < row["atr"] * 0.75
-        )
-
-    if not pd.isna(resistance):
-
-        resistance_too_close = (
-            abs(
-                resistance
-                - row["close"]
-            )
-            < row["atr"] * 0.75
-        )
-
-    if support_too_close:
-
-        bull_score -= 1
-
-    if resistance_too_close:
-
-        bear_score -= 1
-
-    # ------------------------------------------------------------
-    # CUERPO DE VELA
-    # ------------------------------------------------------------
-
-    body_ratio = row[
-        "body_ratio"
-    ]
-
-    if body_ratio >= 0.60:
-
-        if is_bullish(row):
-
-            bull_score += 0.75
-
-            reasons_bull.append(
-                "Cuerpo de vela fuerte"
-            )
-
-        elif is_bearish(row):
-
-            bear_score += 0.75
-
-            reasons_bear.append(
-                "Cuerpo de vela fuerte"
-            )
-
-    # ------------------------------------------------------------
-    # CONFLICTO
-    # ------------------------------------------------------------
-
-    trend_bull = (
-        row["ema20"]
-        > row["ema50"]
+    previous_bear = (
+        df["ema20"]
+        .shift(1) <
+        df["ema50"]
+        .shift(1)
     )
 
-    trend_bear = (
-        row["ema20"]
-        < row["ema50"]
+    df["CHOCH_BULL"] = (
+        previous_bear &
+        df["BOS_BULL"]
     )
 
-    conflict_bull = (
-        trend_bear
-        and structure == "BULLISH"
-        and bull_score < 8
+    df["CHOCH_BEAR"] = (
+        previous_bull &
+        df["BOS_BEAR"]
     )
 
-    conflict_bear = (
-        trend_bull
-        and structure == "BEARISH"
-        and bear_score < 8
-    )
+    # --------------------------------------------------------
+    # Velas
+    # --------------------------------------------------------
 
-    if conflict_bull:
+    body = (
+        close -
+        open_
+    ).abs()
 
-        bull_score -= 2
-
-    if conflict_bear:
-
-        bear_score -= 2
-
-    # ------------------------------------------------------------
-    # DECISIÓN
-    # ------------------------------------------------------------
-
-    difference = (
-        bull_score
-        - bear_score
-    )
-
-    action = "ESPERAR"
-
-    direction = ""
-
-    reasons = []
-
-    if (
-        bull_score >= 7
-        and difference >= 2
-        and not resistance_too_close
-        and not conflict_bull
-    ):
-
-        action = "ALZA"
-
-        direction = "CALL"
-
-        reasons = reasons_bull
-
-    elif (
-        bear_score >= 7
-        and difference <= -2
-        and not support_too_close
-        and not conflict_bear
-    ):
-
-        action = "BAJA"
-
-        direction = "PUT"
-
-        reasons = reasons_bear
-
-    else:
-
-        if (
-            bull_score
-            >= bear_score
-        ):
-
-            reasons = reasons_bull
-
-        else:
-
-            reasons = reasons_bear
-
-    confidence = (
-        max(
-            bull_score,
-            bear_score,
-        )
-        / 12.0
-        * 100
-    )
-
-    confidence = max(
+    candle_range = (
+        high -
+        low
+    ).replace(
         0,
-        min(
-            100,
-            confidence,
-        ),
+        np.nan,
     )
 
-    return {
-        "action": action,
-        "direction": direction,
-        "bull_score": bull_score,
-        "bear_score": bear_score,
-        "difference": difference,
-        "confidence": confidence,
-        "reasons": " | ".join(
-            reasons[:8]
-        ),
-        "price": row["close"],
-        "ema20": row["ema20"],
-        "ema50": row["ema50"],
-        "rsi": row["rsi"],
-        "macd": row["macd"],
-        "macd_signal": row[
-            "macd_signal"
+    maximum_oc = pd.concat(
+        [
+            open_,
+            close,
         ],
-        "adx": row["adx"],
-        "atr": row["atr"],
-        "structure": structure,
-        "bos": bool(row["bos"]),
-        "choch": bool(row["choch"]),
-        "engulfing": bool(
-            row["engulfing"]
-        ),
-        "rejection": bool(
-            row["rejection"]
-        ),
-        "impulse": bool(
-            row["impulse"]
-        ),
-        "pullback": bool(
-            row["pullback"]
-        ),
-        "support": support,
-        "resistance": resistance,
-        "support_too_close": (
-            support_too_close
-        ),
-        "resistance_too_close": (
-            resistance_too_close
-        ),
-    }
+        axis=1,
+    ).max(axis=1)
+
+    minimum_oc = pd.concat(
+        [
+            open_,
+            close,
+        ],
+        axis=1,
+    ).min(axis=1)
+
+    upper_wick = (
+        high -
+        maximum_oc
+    )
+
+    lower_wick = (
+        minimum_oc -
+        low
+    )
+
+    df["body_ratio"] = (
+        body /
+        candle_range
+    )
+
+    df["bullish_candle"] = (
+        close >
+        open_
+    )
+
+    df["bearish_candle"] = (
+        close <
+        open_
+    )
+
+    # --------------------------------------------------------
+    # Engulfing
+    # --------------------------------------------------------
+
+    previous_open = (
+        open_.shift(1)
+    )
+
+    previous_close = (
+        close.shift(1)
+    )
+
+    df["bullish_engulf"] = (
+        (close > open_) &
+        (previous_close < previous_open) &
+        (open_ <= previous_close) &
+        (close >= previous_open)
+    )
+
+    df["bearish_engulf"] = (
+        (close < open_) &
+        (previous_close > previous_open) &
+        (open_ >= previous_close) &
+        (close <= previous_open)
+    )
+
+    # --------------------------------------------------------
+    # Rechazo
+    # --------------------------------------------------------
+
+    df["bullish_rejection"] = (
+        (lower_wick > body * 1.5) &
+        (lower_wick > upper_wick)
+    )
+
+    df["bearish_rejection"] = (
+        (upper_wick > body * 1.5) &
+        (upper_wick > lower_wick)
+    )
+
+    # --------------------------------------------------------
+    # Impulso
+    # --------------------------------------------------------
+
+    df["bullish_impulse"] = (
+        (close > open_) &
+        (df["body_ratio"] >= 0.60)
+    )
+
+    df["bearish_impulse"] = (
+        (close < open_) &
+        (df["body_ratio"] >= 0.60)
+    )
+
+    # --------------------------------------------------------
+    # Pullback
+    # --------------------------------------------------------
+
+    df["bullish_pullback"] = (
+        (df["ema20"] > df["ema50"]) &
+        (low <= df["ema20"]) &
+        (close > df["ema20"])
+    )
+
+    df["bearish_pullback"] = (
+        (df["ema20"] < df["ema50"]) &
+        (high >= df["ema20"]) &
+        (close < df["ema20"])
+    )
+
+    # --------------------------------------------------------
+    # Soporte
+    # --------------------------------------------------------
+
+    df["support"] = (
+        low
+        .shift(1)
+        .rolling(
+            20,
+            min_periods=10,
+        )
+        .min()
+    )
+
+    # --------------------------------------------------------
+    # Resistencia
+    # --------------------------------------------------------
+
+    df["resistance"] = (
+        high
+        .shift(1)
+        .rolling(
+            20,
+            min_periods=10,
+        )
+        .max()
+    )
+
+    df["support_distance"] = (
+        close -
+        df["support"]
+    )
+
+    df["resistance_distance"] = (
+        df["resistance"] -
+        close
+    )
+
+    df["support_too_close"] = (
+        df["support_distance"] <
+        df["atr"] * 0.75
+    )
+
+    df["resistance_too_close"] = (
+        df["resistance_distance"] <
+        df["atr"] * 0.75
+    )
+
+    return df
 
 
-# ================================================================
-# BACKTEST
-# ================================================================
+# ============================================================
+# SEÑALES
+# ============================================================
 
-def run_backtest(
-    base_1m,
-    timeframe_name,
-    max_bars,
-    payout=PAYOUT,
+def generate_signals(
+    df,
 ):
 
-    minutes = TIMEFRAMES[
-        timeframe_name
-    ]
-
-    print()
-    print("-" * 80)
-    print(
-        f"BACKTEST {timeframe_name}"
-    )
-    print("-" * 80)
-
-    # ------------------------------------------------------------
-    # AGREGAR
-    # ------------------------------------------------------------
-
-    tf = aggregate_minutes(
-        base_1m,
-        minutes,
+    df = calculate_indicators(
+        df
     )
 
-    if len(tf) < 100:
-
-        print(
-            f"⚠ No hay suficientes "
-            f"velas para {timeframe_name}"
-        )
-
-        return None
-
-    # ------------------------------------------------------------
-    # INDICADORES
-    # ------------------------------------------------------------
-
-    print(
-        f"Calculando indicadores "
-        f"({len(tf):,} velas)..."
+    df = calculate_price_action(
+        df
     )
 
-    tf = calculate_indicators(
-        tf
+    score = pd.Series(
+        0.0,
+        index=df.index,
     )
 
-    tf = calculate_price_action(
-        tf
+    # --------------------------------------------------------
+    # EMA
+    # --------------------------------------------------------
+
+    score += np.where(
+        df["ema20"] >
+        df["ema50"],
+        2.0,
+        np.where(
+            df["ema20"] <
+            df["ema50"],
+            -2.0,
+            0.0,
+        ),
     )
 
-    # ------------------------------------------------------------
-    # DATOS 1M
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
+    # EMA SLOPE
+    # --------------------------------------------------------
 
-    one_minute = (
-        base_1m.copy()
-        .set_index("datetime")
-        .sort_index()
+    score += np.where(
+        df["ema_slope"] > 0,
+        1.0,
+        np.where(
+            df["ema_slope"] < 0,
+            -1.0,
+            0.0,
+        ),
     )
 
-    # ------------------------------------------------------------
-    # RANGO
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
 
-    valid_start = 60
-
-    if len(tf) <= (
-        valid_start + 1
-    ):
-
-        return None
-
-    end_index = (
-        len(tf) - 1
+    score += np.where(
+        df["rsi"].between(
+            52,
+            68,
+        ),
+        1.0,
+        np.where(
+            df["rsi"].between(
+                32,
+                48,
+            ),
+            -1.0,
+            0.0,
+        ),
     )
 
-    start_index = max(
-        valid_start,
-        end_index - max_bars,
+    # Extremos
+    score += np.where(
+        df["rsi"] > 75,
+        -1.0,
+        np.where(
+            df["rsi"] < 25,
+            1.0,
+            0.0,
+        ),
     )
 
-    trades = []
+    # --------------------------------------------------------
+    # MACD
+    # --------------------------------------------------------
 
-    checked = 0
+    score += np.where(
+        df["macd"] >
+        df["macd_signal"],
+        1.0,
+        np.where(
+            df["macd"] <
+            df["macd_signal"],
+            -1.0,
+            0.0,
+        ),
+    )
 
-    signals = 0
+    score += np.where(
+        df["macd_hist"] > 0,
+        0.5,
+        np.where(
+            df["macd_hist"] < 0,
+            -0.5,
+            0.0,
+        ),
+    )
 
-    wins = 0
+    # --------------------------------------------------------
+    # ADX
+    # --------------------------------------------------------
 
-    losses = 0
+    score += np.where(
+        (
+            df["adx"] >= 20
+        ) &
+        (
+            df["ema20"] >
+            df["ema50"]
+        ),
+        1.0,
+        0.0,
+    )
 
-    ties = 0
+    score += np.where(
+        (
+            df["adx"] >= 20
+        ) &
+        (
+            df["ema20"] <
+            df["ema50"]
+        ),
+        -1.0,
+        0.0,
+    )
 
-    # ------------------------------------------------------------
-    # RECORRER
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
+    # BOS
+    # --------------------------------------------------------
 
-    for i in range(
-        start_index,
-        end_index,
-    ):
+    score += np.where(
+        df["BOS_BULL"],
+        2.5,
+        0,
+    )
 
-        checked += 1
+    score += np.where(
+        df["BOS_BEAR"],
+        -2.5,
+        0,
+    )
 
-        signal = generate_signal(
-            tf,
-            i,
-        )
+    # --------------------------------------------------------
+    # CHOCH
+    # --------------------------------------------------------
 
-        if signal is None:
-            continue
+    score += np.where(
+        df["CHOCH_BULL"],
+        2.0,
+        0,
+    )
 
-        if (
-            signal["action"]
-            == "ESPERAR"
-        ):
+    score += np.where(
+        df["CHOCH_BEAR"],
+        -2.0,
+        0,
+    )
 
-            continue
+    # --------------------------------------------------------
+    # ENGULFING
+    # --------------------------------------------------------
 
-        signals += 1
+    score += np.where(
+        df["bullish_engulf"],
+        2.0,
+        0,
+    )
 
-        analysis_time = (
-            tf["datetime"].iloc[i]
-        )
+    score += np.where(
+        df["bearish_engulf"],
+        -2.0,
+        0,
+    )
 
-        # --------------------------------------------------------
-        # ENTRADA
-        #
-        # La señal se genera después
-        # del cierre del timeframe.
-        #
-        # Entrada = siguiente apertura 1M.
-        # --------------------------------------------------------
+    # --------------------------------------------------------
+    # REJECTION
+    # --------------------------------------------------------
 
-        entry_time = (
-            analysis_time
-            + pd.Timedelta(
-                minutes=minutes
-            )
-        )
+    score += np.where(
+        df["bullish_rejection"],
+        1.5,
+        0,
+    )
 
-        if (
-            entry_time
-            not in one_minute.index
-        ):
+    score += np.where(
+        df["bearish_rejection"],
+        -1.5,
+        0,
+    )
 
-            future_entries = (
-                one_minute.loc[
-                    one_minute.index
-                    >= entry_time
-                ]
-            )
+    # --------------------------------------------------------
+    # IMPULSE
+    # --------------------------------------------------------
 
-            if future_entries.empty:
+    score += np.where(
+        df["bullish_impulse"],
+        1.0,
+        0,
+    )
 
-                continue
+    score += np.where(
+        df["bearish_impulse"],
+        -1.0,
+        0,
+    )
 
-            entry_time = (
-                future_entries
-                .index[0]
-            )
+    # --------------------------------------------------------
+    # PULLBACK
+    # --------------------------------------------------------
 
-        entry_row = (
-            one_minute.loc[
-                entry_time
-            ]
-        )
+    score += np.where(
+        df["bullish_pullback"],
+        1.5,
+        0,
+    )
 
-        entry_price = float(
-            entry_row["open"]
-        )
+    score += np.where(
+        df["bearish_pullback"],
+        -1.5,
+        0,
+    )
 
-        # --------------------------------------------------------
-        # EXPIRACIÓN
-        #
-        # 5M:
-        #
-        # Entrada 10:05
-        # Expira 10:09 cierre 1M
-        #
-        # 15M:
-        # Entrada 10:15
-        # Expira 10:29 cierre 1M
-        # --------------------------------------------------------
+    # --------------------------------------------------------
+    # CUERPO
+    # --------------------------------------------------------
 
-        expiry_time = (
-            entry_time
-            + pd.Timedelta(
-                minutes=minutes - 1
-            )
-        )
+    score += np.where(
+        (
+            df["body_ratio"] >= 0.60
+        ) &
+        (
+            df["bullish_candle"]
+        ),
+        0.75,
+        0,
+    )
 
-        future_expiry = (
-            one_minute.loc[
-                one_minute.index
-                >= expiry_time
-            ]
-        )
+    score += np.where(
+        (
+            df["body_ratio"] >= 0.60
+        ) &
+        (
+            df["bearish_candle"]
+        ),
+        -0.75,
+        0,
+    )
 
-        if future_expiry.empty:
+    # --------------------------------------------------------
+    # RESISTENCIA
+    # --------------------------------------------------------
 
-            continue
+    score += np.where(
+        (
+            df["resistance_too_close"]
+        ) &
+        (
+            score > 0
+        ),
+        -1.5,
+        0,
+    )
 
-        actual_expiry_time = (
-            future_expiry.index[0]
-        )
+    # --------------------------------------------------------
+    # SOPORTE
+    # --------------------------------------------------------
 
-        expiry_price = float(
-            future_expiry.iloc[0][
-                "close"
-            ]
-        )
+    score += np.where(
+        (
+            df["support_too_close"]
+        ) &
+        (
+            score < 0
+        ),
+        1.5,
+        0,
+    )
 
-        direction = signal[
-            "direction"
+    df["score"] = score
+
+    # ========================================================
+    # SEÑALES FINALES
+    # ========================================================
+
+    bullish = (
+        (df["score"] >= 7) &
+        (~df["resistance_too_close"])
+    )
+
+    bearish = (
+        (df["score"] <= -7) &
+        (~df["support_too_close"])
+    )
+
+    df["signal"] = np.where(
+        bullish,
+        "ALZA",
+        np.where(
+            bearish,
+            "BAJA",
+            "",
+        ),
+    )
+
+    return df
+
+
+# ============================================================
+# EVALUAR OPERACIONES
+# ============================================================
+
+def evaluate_operations(
+    df,
+    timeframe,
+):
+
+    signals = df[
+        df["signal"] != ""
+    ].copy()
+
+    if signals.empty:
+
+        return pd.DataFrame()
+
+    # --------------------------------------------------------
+    # Entrada:
+    # siguiente vela del timeframe
+    # --------------------------------------------------------
+
+    signals["entry"] = (
+        df["open"]
+        .shift(-1)
+        .loc[
+            signals.index
         ]
+    )
 
-        # --------------------------------------------------------
-        # RESULTADO
-        # --------------------------------------------------------
+    signals["entry_time"] = (
+        df["datetime"]
+        .shift(-1)
+        .loc[
+            signals.index
+        ]
+    )
 
-        if direction == "CALL":
+    # --------------------------------------------------------
+    # Expiración:
+    # cierre de la siguiente vela
+    # --------------------------------------------------------
 
-            if (
-                expiry_price
-                > entry_price
-            ):
+    signals["expiry"] = (
+        df["close"]
+        .shift(-1)
+        .loc[
+            signals.index
+        ]
+    )
 
-                result = "WIN"
+    signals["expiry_time"] = (
+        df["datetime"]
+        .shift(-1)
+        .loc[
+            signals.index
+        ]
+    )
 
-            elif (
-                expiry_price
-                < entry_price
-            ):
+    signals = signals.dropna(
+        subset=[
+            "entry",
+            "expiry",
+        ]
+    )
 
-                result = "LOSS"
+    if signals.empty:
 
-            else:
+        return pd.DataFrame()
 
-                result = "TIE"
+    # --------------------------------------------------------
+    # WIN / LOSS / TIE
+    # --------------------------------------------------------
 
-        else:
-
-            if (
-                expiry_price
-                < entry_price
-            ):
-
-                result = "WIN"
-
-            elif (
-                expiry_price
-                > entry_price
-            ):
-
-                result = "LOSS"
-
-            else:
-
-                result = "TIE"
-
-        # --------------------------------------------------------
-        # PROFIT
-        # --------------------------------------------------------
-
-        if result == "WIN":
-
-            wins += 1
-
-            profit = payout
-
-        elif result == "LOSS":
-
-            losses += 1
-
-            profit = -1.0
-
-        else:
-
-            ties += 1
-
-            profit = 0.0
-
-        trades.append(
-            {
-                "analysis_time":
-                    analysis_time,
-                "entry_time":
-                    entry_time,
-                "expiry_time":
-                    actual_expiry_time,
-                "direction":
-                    direction,
-                "action":
-                    signal["action"],
-                "entry_price":
-                    entry_price,
-                "expiry_price":
-                    expiry_price,
-                "result":
-                    result,
-                "profit_units":
-                    profit,
-                "bull_score":
-                    signal["bull_score"],
-                "bear_score":
-                    signal["bear_score"],
-                "score_difference":
-                    signal["difference"],
-                "confidence":
-                    signal["confidence"],
-                "ema20":
-                    signal["ema20"],
-                "ema50":
-                    signal["ema50"],
-                "rsi":
-                    signal["rsi"],
-                "macd":
-                    signal["macd"],
-                "macd_signal":
-                    signal["macd_signal"],
-                "adx":
-                    signal["adx"],
-                "atr":
-                    signal["atr"],
-                "structure":
-                    signal["structure"],
-                "bos":
-                    signal["bos"],
-                "choch":
-                    signal["choch"],
-                "engulfing":
-                    signal["engulfing"],
-                "rejection":
-                    signal["rejection"],
-                "impulse":
-                    signal["impulse"],
-                "pullback":
-                    signal["pullback"],
-                "support":
-                    signal["support"],
-                "resistance":
-                    signal["resistance"],
-                "reasons":
-                    signal["reasons"],
-            }
+    win = (
+        (
+            signals["signal"] ==
+            "ALZA"
+        ) &
+        (
+            signals["expiry"] >
+            signals["entry"]
         )
-
-        if signals % 250 == 0:
-
-            print(
-                f"  Señales procesadas: "
-                f"{signals:,} | "
-                f"W: {wins:,} | "
-                f"L: {losses:,} | "
-                f"T: {ties:,}"
+    ) 
+    (
+            (
+                signals["signal"] ==
+                "BAJA"
+            ) &
+            (
+                signals["expiry"] <
+                signals["entry"]
             )
-
-    # ------------------------------------------------------------
-    # SIN OPERACIONES
-    # ------------------------------------------------------------
-
-    if not trades:
-
-        print(
-            "⚠ No se generaron operaciones."
         )
 
-        return None
-
-    result_df = pd.DataFrame(
-        trades
+    tie = (
+        signals["expiry"] ==
+        signals["entry"]
     )
 
-    total = len(
-        result_df
+    signals["result"] = np.where(
+        win,
+        "WIN",
+        np.where(
+            tie,
+            "TIE",
+            "LOSS",
+        ),
     )
 
-    wins = int(
-        (
-            result_df["result"]
-            == "WIN"
-        ).sum()
+    # --------------------------------------------------------
+    # Profit
+    # --------------------------------------------------------
+
+    signals["profit"] = np.where(
+        signals["result"] ==
+        "WIN",
+        PAYOUT,
+        np.where(
+            signals["result"] ==
+            "LOSS",
+            -1.0,
+            0.0,
+        ),
     )
 
-    losses = int(
-        (
-            result_df["result"]
-            == "LOSS"
-        ).sum()
+    signals["equity"] = (
+        signals["profit"]
+        .cumsum()
     )
 
-    ties = int(
-        (
-            result_df["result"]
-            == "TIE"
-        ).sum()
+    peak = (
+        signals["equity"]
+        .cummax()
     )
+
+    signals["drawdown"] = (
+        signals["equity"] -
+        peak
+    )
+
+    return signals[
+        [
+            "datetime",
+            "signal",
+            "score",
+            "entry_time",
+            "entry",
+            "expiry_time",
+            "expiry",
+            "result",
+            "profit",
+            "equity",
+            "drawdown",
+            "ema20",
+            "ema50",
+            "rsi",
+            "macd",
+            "macd_signal",
+            "adx",
+            "atr",
+        ]
+    ].reset_index(
+        drop=True
+    )
+
+
+# ============================================================
+# ESTADÍSTICAS
+# ============================================================
+
+def calculate_statistics(
+    operations,
+    pair,
+    timeframe,
+    candles,
+):
+
+    if operations.empty:
+
+        return {
+            "pair": pair,
+            "timeframe": timeframe,
+            "candles": candles,
+            "operations": 0,
+            "wins": 0,
+            "losses": 0,
+            "ties": 0,
+            "win_rate": 0,
+            "breakeven": round(
+                BREAKEVEN * 100,
+                2,
+            ),
+            "profit": 0,
+            "max_drawdown": 0,
+            "max_loss_streak": 0,
+            "status": "NO SIGNALS",
+        }
+
+    wins = (
+        operations["result"] ==
+        "WIN"
+    ).sum()
+
+    losses = (
+        operations["result"] ==
+        "LOSS"
+    ).sum()
+
+    ties = (
+        operations["result"] ==
+        "TIE"
+    ).sum()
 
     decided = (
-        wins + losses
+        wins +
+        losses
     )
 
-    win_rate = (
-        wins / decided * 100
-        if decided > 0
-        else 0
-    )
+    if decided:
 
-    total_profit = (
-        result_df[
-            "profit_units"
-        ].sum()
-    )
+        win_rate = (
+            wins /
+            decided *
+            100
+        )
 
-    wins_profit = (
-        result_df.loc[
-            result_df["result"]
-            == "WIN",
-            "profit_units",
-        ].sum()
-    )
+    else:
 
-    losses_profit = (
-        result_df.loc[
-            result_df["result"]
-            == "LOSS",
-            "profit_units",
-        ].sum()
-    )
+        win_rate = 0
 
-    # ------------------------------------------------------------
-    # EQUITY
-    # ------------------------------------------------------------
-
-    equity = (
-        result_df[
-            "profit_units"
-        ].cumsum()
-    )
-
-    peak = equity.cummax()
-
-    drawdown = (
-        equity - peak
+    profit = (
+        operations["profit"]
+        .sum()
     )
 
     max_drawdown = (
-        drawdown.min()
+        operations["drawdown"]
+        .min()
     )
 
-    # ------------------------------------------------------------
-    # RACHAS
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
+    # Racha máxima de pérdidas
+    # --------------------------------------------------------
 
-    max_win_streak = 0
+    loss_bool = (
+        operations["result"] ==
+        "LOSS"
+    ).astype(int)
 
-    max_loss_streak = 0
+    if not loss_bool.empty:
 
-    current_win = 0
-
-    current_loss = 0
-
-    for result in result_df[
-        "result"
-    ]:
-
-        if result == "WIN":
-
-            current_win += 1
-
-            current_loss = 0
-
-            max_win_streak = max(
-                max_win_streak,
-                current_win,
+        groups = (
+            loss_bool
+            .groupby(
+                (
+                    loss_bool !=
+                    loss_bool.shift()
+                ).cumsum()
             )
-
-        elif result == "LOSS":
-
-            current_loss += 1
-
-            current_win = 0
-
-            max_loss_streak = max(
-                max_loss_streak,
-                current_loss,
-            )
-
-        else:
-
-            current_win = 0
-            current_loss = 0
-
-    # ------------------------------------------------------------
-    # MOVIMIENTO PRECIO
-    # ------------------------------------------------------------
-
-    first_price = float(
-        result_df[
-            "entry_price"
-        ].iloc[0]
-    )
-
-    last_price = float(
-        result_df[
-            "expiry_price"
-        ].iloc[-1]
-    )
-
-    price_change = (
-        (
-            last_price
-            - first_price
+            .sum()
         )
-        / first_price
-        * 100
-        if first_price != 0
-        else 0
-    )
 
-    # ------------------------------------------------------------
-    # BREAK EVEN
-    # ------------------------------------------------------------
+        max_loss_streak = int(
+            groups.max()
+        )
 
-    breakeven = (
-        1
-        / (1 + payout)
-        * 100
-    )
+    else:
 
-    # ------------------------------------------------------------
-    # RESULTADO
-    # ------------------------------------------------------------
-
-    print()
-    print("=" * 80)
-    print(
-        f"RESULTADO {timeframe_name}"
-    )
-    print("=" * 80)
-
-    print(
-        f"Operaciones:       {total:,}"
-    )
-
-    print(
-        f"WIN:               {wins:,}"
-    )
-
-    print(
-        f"LOSS:              {losses:,}"
-    )
-
-    print(
-        f"TIE:               {ties:,}"
-    )
-
-    print(
-        f"Win Rate:          {win_rate:.2f}%"
-    )
-
-    print(
-        f"Break-even "
-        f"{payout*100:.0f}%:   "
-        f"{breakeven:.2f}%"
-    )
-
-    print(
-        f"Resultado unidades: "
-        f"{total_profit:+.2f}"
-    )
-
-    print(
-        f"Ganancias:          "
-        f"{wins_profit:+.2f}"
-    )
-
-    print(
-        f"Pérdidas:           "
-        f"{losses_profit:+.2f}"
-    )
-
-    print(
-        f"Max Drawdown:       "
-        f"{max_drawdown:.2f}"
-    )
-
-    print(
-        f"Racha WIN máxima:   "
-        f"{max_win_streak}"
-    )
-
-    print(
-        f"Racha LOSS máxima:  "
-        f"{max_loss_streak}"
-    )
-
-    print(
-        f"Movimiento precio:  "
-        f"{price_change:+.2f}%"
-    )
+        max_loss_streak = 0
 
     return {
-        "timeframe":
-            timeframe_name,
-        "operations":
-            total,
-        "wins":
-            wins,
-        "losses":
-            losses,
-        "ties":
-            ties,
-        "win_rate":
+        "pair": pair,
+        "timeframe": timeframe,
+        "candles": candles,
+        "operations": int(
+            len(operations)
+        ),
+        "wins": int(wins),
+        "losses": int(losses),
+        "ties": int(ties),
+        "win_rate": round(
             win_rate,
-        "breakeven":
-            breakeven,
-        "profit_units":
-            total_profit,
-        "wins_profit":
-            wins_profit,
-        "losses_profit":
-            losses_profit,
-        "max_drawdown":
+            2,
+        ),
+        "breakeven": round(
+            BREAKEVEN * 100,
+            2,
+        ),
+        "profit": round(
+            profit,
+            2,
+        ),
+        "max_drawdown": round(
             max_drawdown,
-        "max_win_streak":
-            max_win_streak,
-        "max_loss_streak":
-            max_loss_streak,
-        "price_change_pct":
-            price_change,
-        "trades":
-            result_df,
+            2,
+        ),
+        "max_loss_streak": max_loss_streak,
+        "status": (
+            "PROFITABLE"
+            if profit > 0
+            else "NEGATIVE"
+        ),
     }
 
 
-# ================================================================
-# BACKTEST POR PAR
-# ================================================================
+# ============================================================
+# PREPARAR 1M DE TODOS LOS PARES
+# ============================================================
 
-def backtest_pair(
-    client,
-    pair,
-    max_bars,
-    force_download=False,
+def prepare_base_data(
+    pairs,
+    target_bars,
 ):
 
     print()
-    print("#" * 90)
-    print(
-        f"# PREPARANDO {pair}"
-    )
-    print("#" * 90)
-
-    largest_tf = max(
-        TIMEFRAMES.values()
-    )
-
-    required_1m = (
-        max_bars
-        * largest_tf
-        + WARMUP
-        + largest_tf
-        + 10
-    )
+    separator()
 
     print(
-        f"Minutos 1M requeridos: "
+        "FASE 1/2 - PREPARANDO DATOS 1 MINUTO"
+    )
+
+    separator()
+
+    # --------------------------------------------------------
+    # Para obtener 1M de 1,000,000 y 2M de 1,000,000:
+    #
+    # 2M necesita aproximadamente 2,000,000 velas de 1M.
+    #
+    # Por eso descargamos el máximo necesario UNA VEZ.
+    # --------------------------------------------------------
+
+    required_1m = max(
+        target_bars,
+        target_bars * 2,
+    )
+
+    print(
+        f"1M requerido por par: "
         f"{required_1m:,}"
     )
 
-    approx_days = (
-        required_1m / 1440
-    )
+    base_data = {}
 
-    print(
-        f"Tiempo calendario aproximado: "
-        f"{approx_days:.1f} días"
-    )
+    for pair in pairs:
 
-    try:
-
-        base = download_1m_history(
-            client=client,
-            symbol=pair,
-            required_bars=required_1m,
-            force=force_download,
+        df = download_1m(
+            pair,
+            required_1m,
         )
 
-    except Exception as exc:
+        base_data[pair] = df
 
         print()
 
+    return base_data
+
+
+# ============================================================
+# PROCESAR COMBINACIÓN
+# ============================================================
+
+def process_combination(
+    pair,
+    timeframe,
+    target_bars,
+    base_df,
+    save_operations=True,
+):
+
+    start = time.time()
+
+    try:
+
+        # ----------------------------------------------------
+        # 1M
+        # ----------------------------------------------------
+
+        if timeframe == "1min":
+
+            df = base_df.copy()
+
+            if len(df) > target_bars:
+
+                df = df.tail(
+                    target_bars
+                ).reset_index(
+                    drop=True
+                )
+
+        # ----------------------------------------------------
+        # 2M
+        # ----------------------------------------------------
+
+        elif timeframe == "2min":
+
+            df = load_cache(
+                pair,
+                "2min",
+            )
+
+            if (
+                df.empty or
+                len(df) < target_bars
+            ):
+
+                df = build_2m_from_1m(
+                    pair,
+                    base_df,
+                    target_bars,
+                )
+
+            if len(df) > target_bars:
+
+                df = df.tail(
+                    target_bars
+                ).reset_index(
+                    drop=True
+                )
+
+        # ----------------------------------------------------
+        # RESTO
+        # ----------------------------------------------------
+
+        else:
+
+            df = download_direct(
+                pair,
+                timeframe,
+                target_bars,
+            )
+
+            if len(df) > target_bars:
+
+                df = df.tail(
+                    target_bars
+                ).reset_index(
+                    drop=True
+                )
+
+        candles = len(df)
+
+        if candles < 100:
+
+            print(
+                f"{pair} {timeframe}: "
+                f"muy pocas velas "
+                f"({candles})"
+            )
+
+            return None
+
         print(
-            f"❌ ERROR descargando {pair}:"
+            f"    Calculando "
+            f"{pair} {timeframe}: "
+            f"{candles:,} velas"
         )
 
-        print(exc)
+        # ----------------------------------------------------
+        # Señales
+        # ----------------------------------------------------
 
-        return []
-
-    if len(base) < 500:
-
-        print(
-            "❌ Muy pocos datos para "
-            "hacer backtest."
+        signal_df = generate_signals(
+            df
         )
 
-        return []
+        # ----------------------------------------------------
+        # Operaciones
+        # ----------------------------------------------------
 
-    all_summaries = []
+        operations = evaluate_operations(
+            signal_df,
+            timeframe,
+        )
 
-    for timeframe in TIMEFRAMES:
+        # ----------------------------------------------------
+        # Guardar operaciones
+        # ----------------------------------------------------
 
-        try:
+        if (
+            save_operations and
+            not operations.empty
+        ):
 
-            result = run_backtest(
-                base_1m=base,
-                timeframe_name=timeframe,
-                max_bars=max_bars,
+            output = result_file(
+                pair,
+                timeframe,
             )
 
-            if result is None:
-
-                continue
-
-            RESULTS_DIR.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            operations_file = (
-                RESULTS_DIR
-                / f"{pair}_{timeframe}_operations.csv"
-            )
-
-            result[
-                "trades"
-            ].to_csv(
-                operations_file,
+            operations.to_csv(
+                output,
                 index=False,
             )
 
-            summary = {
-                "pair":
+        # ----------------------------------------------------
+        # Stats
+        # ----------------------------------------------------
+
+        stats = calculate_statistics(
+            operations,
+            pair,
+            timeframe,
+            candles,
+        )
+
+        elapsed = (
+            time.time() -
+            start
+        )
+
+        print(
+            f"    RESULTADO -> "
+            f"{stats['operations']:,} ops | "
+            f"W {stats['wins']:,} | "
+            f"L {stats['losses']:,} | "
+            f"T {stats['ties']:,} | "
+            f"WR {stats['win_rate']:.2f}% | "
+            f"Profit {stats['profit']:+.2f} | "
+            f"{elapsed:.1f}s"
+        )
+
+        return stats
+
+    except Exception as e:
+
+        print()
+        print(
+            f"ERROR en "
+            f"{pair} {timeframe}:"
+        )
+
+        print(
+            repr(e)
+        )
+
+        return None
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+def run_backtest(
+    pairs,
+    timeframes,
+    target_bars,
+    workers,
+    save_operations,
+):
+
+    start_total = time.time()
+
+    separator()
+
+    print(
+        "TRADING ANALYZER"
+    )
+
+    print(
+        "BACKTEST MASIVO V6"
+    )
+
+    separator()
+
+    print(
+        f"Pares: "
+        f"{len(pairs)}"
+    )
+
+    print(
+        f"Temporalidades: "
+        f"{len(timeframes)}"
+    )
+
+    print(
+        f"Objetivo: "
+        f"{target_bars:,} velas"
+    )
+
+    print(
+        f"Payout: "
+        f"{PAYOUT:.0%}"
+    )
+
+    print(
+        f"Break-even: "
+        f"{BREAKEVEN * 100:.2f}%"
+    )
+
+    print(
+        f"Workers: "
+        f"{workers}"
+    )
+
+    print()
+
+    # ========================================================
+    # FASE 1
+    # ========================================================
+    #
+    # SOLO se descarga 1M una vez por par.
+    #
+    # Esto elimina:
+    #
+    # 1M -> descarga
+    # 2M -> descarga 1M otra vez
+    #
+    # Ahora:
+    #
+    # 1M ─┐
+    #     ├──> reutilizado
+    # 2M ─┘
+    #
+    # ========================================================
+
+    base_data = prepare_base_data(
+        pairs,
+        target_bars,
+    )
+
+    # ========================================================
+    # FASE 2
+    # ========================================================
+
+    print()
+    separator()
+
+    print(
+        "FASE 2/2 - BACKTEST"
+    )
+
+    separator()
+
+    tasks = []
+
+    for pair in pairs:
+
+        for timeframe in timeframes:
+
+            tasks.append(
+                (
                     pair,
-                "timeframe":
                     timeframe,
-                "operations":
-                    result["operations"],
-                "wins":
-                    result["wins"],
-                "losses":
-                    result["losses"],
-                "ties":
-                    result["ties"],
-                "win_rate":
-                    result["win_rate"],
-                "breakeven":
-                    result["breakeven"],
-                "profit_units":
-                    result["profit_units"],
-                "max_drawdown":
-                    result["max_drawdown"],
-                "max_win_streak":
-                    result["max_win_streak"],
-                "max_loss_streak":
-                    result["max_loss_streak"],
-                "price_change_pct":
-                    result["price_change_pct"],
-            }
-
-            all_summaries.append(
-                summary
+                )
             )
 
-            print(
-                f"✓ Operaciones guardadas: "
-                f"{operations_file}"
+    results = []
+
+    completed = 0
+
+    total = len(tasks)
+
+    # --------------------------------------------------------
+    # IMPORTANTE:
+    #
+    # Los datos 1M ya están preparados.
+    # No se descargan nuevamente.
+    #
+    # --------------------------------------------------------
+
+    with ThreadPoolExecutor(
+        max_workers=workers
+    ) as executor:
+
+        futures = {}
+
+        for pair, timeframe in tasks:
+
+            future = executor.submit(
+                process_combination,
+                pair,
+                timeframe,
+                target_bars,
+                base_data[pair],
+                save_operations,
             )
 
-        except Exception as exc:
-
-            print()
-
-            print(
-                f"❌ Error en "
-                f"{pair} {timeframe}: "
-                f"{exc}"
+            futures[future] = (
+                pair,
+                timeframe,
             )
 
-    return all_summaries
+        for future in as_completed(
+            futures
+        ):
 
-
-# ================================================================
-# MAIN
-# ================================================================
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Trading Analyzer - "
-            "Backtest masivo con Twelve Data"
-        )
-    )
-
-    parser.add_argument(
-        "--pairs",
-        nargs="+",
-        default=DEFAULT_PAIRS,
-        help=(
-            "Pares Forex. "
-            "Ejemplo: EURUSD GBPUSD"
-        ),
-    )
-
-    parser.add_argument(
-        "--max-bars",
-        type=int,
-        default=10000,
-        help=(
-            "Cantidad de velas por timeframe. "
-            "Default: 10000"
-        ),
-    )
-
-    parser.add_argument(
-        "--payout",
-        type=float,
-        default=0.90,
-        help=(
-            "Payout decimal. "
-            "Ejemplo: 0.90"
-        ),
-    )
-
-    parser.add_argument(
-        "--force-download",
-        action="store_true",
-        help=(
-            "Ignorar cache y descargar "
-            "nuevamente"
-        ),
-    )
-
-    args = parser.parse_args()
-
-    global PAYOUT
-
-    PAYOUT = args.payout
-
-    # ------------------------------------------------------------
-    # API KEY
-    # ------------------------------------------------------------
-
-    api_key = os.getenv(
-        "TWELVE_DATA_API_KEY"
-    )
-
-    if not api_key:
-
-        print()
-        print("=" * 80)
-        print(
-            "❌ FALTA API KEY"
-        )
-        print("=" * 80)
-        print()
-
-        print(
-            "No se encontró "
-            "TWELVE_DATA_API_KEY."
-        )
-
-        print()
-
-        print(
-            "Comprueba que exista:"
-        )
-
-        print(
-            "  .env"
-        )
-
-        print()
-
-        print(
-            "Y que contenga:"
-        )
-
-        print(
-            "  TWELVE_DATA_API_KEY=TU_API_KEY"
-        )
-
-        print()
-
-        sys.exit(1)
-
-    # ------------------------------------------------------------
-    # DIRECTORIOS
-    # ------------------------------------------------------------
-
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    RESULTS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # ------------------------------------------------------------
-    # CABECERA
-    # ------------------------------------------------------------
-
-    print()
-
-    print("=" * 90)
-
-    print(
-        "TRADING ANALYZER - BACKTEST MASIVO"
-    )
-
-    print(
-        "Versión: 4.1-TWELVE-DATA"
-    )
-
-    print("=" * 90)
-
-    print(
-        f"Pares:       "
-        f"{len(args.pairs)}"
-    )
-
-    print(
-        "Timeframes:  "
-        + ", ".join(
-            TIMEFRAMES.keys()
-        )
-    )
-
-    print(
-        f"Objetivo:    "
-        f"{args.max_bars:,} "
-        f"velas por timeframe"
-    )
-
-    print(
-        "Fuente:      Twelve Data"
-    )
-
-    print(
-        "Datos:       1M -> TF"
-    )
-
-    print(
-        "Entrada:     siguiente apertura 1M"
-    )
-
-    print(
-        "Payout:      "
-        f"{PAYOUT*100:.0f}%"
-    )
-
-    print(
-        "Break-even:  "
-        f"{1/(1+PAYOUT)*100:.2f}%"
-    )
-
-    print("=" * 90)
-
-    # ------------------------------------------------------------
-    # CLIENTE
-    # ------------------------------------------------------------
-
-    client = TwelveDataClient(
-        api_key
-    )
-
-    # ------------------------------------------------------------
-    # COMPROBAR CONEXIÓN
-    # ------------------------------------------------------------
-
-    print()
-
-    print(
-        "Comprobando conexión "
-        "con Twelve Data..."
-    )
-
-    try:
-
-        test = client.request_price(
-            {
-                "symbol": "EUR/USD"
-            }
-        )
-
-        print(
-            "✓ Twelve Data respondió correctamente."
-        )
-
-        if isinstance(test, dict):
-
-            price = test.get(
-                "price"
+            pair, timeframe = (
+                futures[future]
             )
 
-            if price is not None:
+            completed += 1
 
-                print(
-                    f"✓ EUR/USD actual: "
-                    f"{price}"
+            result = future.result()
+
+            if result:
+
+                results.append(
+                    result
                 )
 
-    except Exception as exc:
+            print()
+            print(
+                f"PROGRESO: "
+                f"{completed}/{total}"
+            )
+
+    # ========================================================
+    # RESUMEN
+    # ========================================================
+
+    if not results:
 
         print()
-
         print(
-            "❌ No se pudo validar "
-            "la API de Twelve Data."
-        )
-
-        print(exc)
-
-        sys.exit(1)
-
-    # ------------------------------------------------------------
-    # RESULTADOS
-    # ------------------------------------------------------------
-
-    all_results = []
-
-    for pair in args.pairs:
-
-        pair = (
-            pair
-            .upper()
-            .replace("/", "")
-            .replace("-", "")
-        )
-
-        results = backtest_pair(
-            client=client,
-            pair=pair,
-            max_bars=args.max_bars,
-            force_download=(
-                args.force_download
-            ),
-        )
-
-        all_results.extend(
-            results
-        )
-
-    # ------------------------------------------------------------
-    # RESUMEN GLOBAL
-    # ------------------------------------------------------------
-
-    print()
-    print()
-
-    print("#" * 100)
-
-    print(
-        "# RESUMEN GLOBAL"
-    )
-
-    print("#" * 100)
-
-    if not all_results:
-
-        print(
-            "No se generaron resultados."
+            "No se obtuvieron resultados."
         )
 
         return
 
-    summary_df = pd.DataFrame(
-        all_results
+    summary = pd.DataFrame(
+        results
+    )
+
+    summary = summary.sort_values(
+        [
+            "pair",
+            "timeframe",
+        ]
     )
 
     summary_file = (
-        RESULTS_DIR
-        / "BACKTEST_SUMMARY.csv"
+        RESULTS_DIR /
+        "BACKTEST_SUMMARY.csv"
     )
 
-    summary_df.to_csv(
+    summary.to_csv(
         summary_file,
         index=False,
     )
 
-    # ------------------------------------------------------------
+    # ========================================================
     # TABLA
-    # ------------------------------------------------------------
+    # ========================================================
 
-    display_columns = [
+    print()
+    separator()
+
+    print(
+        "RESUMEN FINAL"
+    )
+
+    separator()
+
+    columns = [
         "pair",
         "timeframe",
+        "candles",
         "operations",
         "wins",
         "losses",
         "ties",
         "win_rate",
-        "profit_units",
+        "profit",
         "max_drawdown",
         "max_loss_streak",
     ]
 
-    display = summary_df[
-        display_columns
-    ].copy()
-
-    display["win_rate"] = (
-        display["win_rate"]
-        .map(
-            lambda x:
-                f"{x:.2f}%"
-        )
-    )
-
-    display["profit_units"] = (
-        display["profit_units"]
-        .map(
-            lambda x:
-                f"{x:+.2f}"
-        )
-    )
-
-    display["max_drawdown"] = (
-        display["max_drawdown"]
-        .map(
-            lambda x:
-                f"{x:.2f}"
-        )
-    )
-
-    print()
-
     print(
-        display.to_string(
+        summary[
+            columns
+        ].to_string(
             index=False
         )
     )
 
+    # ========================================================
+    # TOTALES
+    # ========================================================
+
+    total_ops = int(
+        summary[
+            "operations"
+        ].sum()
+    )
+
+    total_wins = int(
+        summary[
+            "wins"
+        ].sum()
+    )
+
+    total_losses = int(
+        summary[
+            "losses"
+        ].sum()
+    )
+
+    total_ties = int(
+        summary[
+            "ties"
+        ].sum()
+    )
+
+    total_decided = (
+        total_wins +
+        total_losses
+    )
+
+    if total_decided:
+
+        global_wr = (
+            total_wins /
+            total_decided *
+            100
+        )
+
+    else:
+
+        global_wr = 0
+
+    total_profit = (
+        summary[
+            "profit"
+        ].sum()
+    )
+
     print()
+    separator()
 
     print(
-        "✓ Resumen guardado en:"
+        "TOTALES"
+    )
+
+    separator()
+
+    print(
+        f"Operaciones: "
+        f"{total_ops:,}"
     )
 
     print(
-        f"  {summary_file}"
+        f"Wins: "
+        f"{total_wins:,}"
+    )
+
+    print(
+        f"Losses: "
+        f"{total_losses:,}"
+    )
+
+    print(
+        f"Ties: "
+        f"{total_ties:,}"
+    )
+
+    print(
+        f"Win rate: "
+        f"{global_wr:.2f}%"
+    )
+
+    print(
+        f"Break-even: "
+        f"{BREAKEVEN * 100:.2f}%"
+    )
+
+    print(
+        f"Profit: "
+        f"{total_profit:+.2f}"
+    )
+
+    elapsed_total = (
+        time.time() -
+        start_total
+    )
+
+    print(
+        f"Tiempo total: "
+        f"{elapsed_total / 60:.2f} minutos"
     )
 
     print()
-
     print(
-        "✓ Archivos individuales:"
+        "Resumen:"
     )
 
     print(
-        f"  {RESULTS_DIR.resolve()}"
+        summary_file
     )
 
-    print()
+    separator()
 
-    print("=" * 100)
 
-    print(
-        "BACKTEST FINALIZADO"
+# ============================================================
+# ARGUMENTOS
+# ============================================================
+
+def parse_args():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Trading Analyzer "
+            "Backtester V6"
+        )
     )
 
-    print("=" * 100)
+    parser.add_argument(
+        "--target-bars",
+        type=int,
+        default=DEFAULT_TARGET_BARS,
+    )
+
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+    )
+
+    parser.add_argument(
+        "--pairs",
+        nargs="*",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--timeframes",
+        nargs="*",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--no-save-operations",
+        action="store_true",
+    )
+
+    return parser.parse_args()
 
 
-# ================================================================
-# EJECUTAR
-# ================================================================
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    args = parse_args()
+
+    pairs = (
+        args.pairs
+        if args.pairs
+        else PAIRS
+    )
+
+    timeframes = (
+        args.timeframes
+        if args.timeframes
+        else TIMEFRAMES
+    )
+
+    # --------------------------------------------------------
+    # Validar pares
+    # --------------------------------------------------------
+
+    if not pairs:
+
+        print(
+            "No hay pares."
+        )
+
+        sys.exit(1)
+
+    # --------------------------------------------------------
+    # Validar temporalidades
+    # --------------------------------------------------------
+
+    for timeframe in timeframes:
+
+        if timeframe not in TF_MINUTES:
+
+            print(
+                f"ERROR: timeframe "
+                f"no válido: "
+                f"{timeframe}"
+            )
+
+            print(
+                "Disponibles:"
+            )
+
+            print(
+                ", ".join(
+                    TIMEFRAMES
+                )
+            )
+
+            sys.exit(1)
+
+    # --------------------------------------------------------
+    # Validar target
+    # --------------------------------------------------------
+
+    if args.target_bars <= 0:
+
+        print(
+            "target-bars debe ser > 0"
+        )
+
+        sys.exit(1)
+
+    # --------------------------------------------------------
+    # Validar workers
+    # --------------------------------------------------------
+
+    if args.workers <= 0:
+
+        print(
+            "workers debe ser > 0"
+        )
+
+        sys.exit(1)
+
+    run_backtest(
+        pairs=pairs,
+        timeframes=timeframes,
+        target_bars=args.target_bars,
+        workers=args.workers,
+        save_operations=(
+            not args.no_save_operations
+        ),
+    )
+
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
 

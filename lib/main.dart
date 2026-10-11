@@ -1459,9 +1459,77 @@ class _TradingAnalyzerPageState extends State<TradingAnalyzerPage> {
 
   bool entryReady = false;
 
+  // ==========================================================
+  // AVISO DE PROPIEDAD
+  // ==========================================================
+
+  void _showOwnershipNotice() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+
+      showDialog<void>(
+        context: context,
+        barrierDismissible: true,
+        builder: (dialogContext) {
+          return AlertDialog(
+            backgroundColor: const Color(0xFF0C1424),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+              side: const BorderSide(color: Color(0xFF263650)),
+            ),
+            title: const Row(
+              children: [
+                Icon(
+                  Icons.verified_user_outlined,
+                  color: Color(0xFF4F8CFF),
+                  size: 20,
+                ),
+                SizedBox(width: 9),
+                Expanded(
+                  child: Text(
+                    'Aviso de propiedad',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 17,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            content: const Text(
+              '© Chase Trader. Este bot es propiedad '
+              'exclusiva de Chase Trader. Queda prohibida '
+              'su reventa, distribución o comercialización '
+              'no autorizada.',
+              style: TextStyle(
+                color: Color(0xFFB7C3D7),
+                fontSize: 12,
+                height: 1.6,
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(),
+                child: const Text(
+                  'Continuar',
+                  style: TextStyle(
+                    color: Color(0xFF4F8CFF),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      );
+    });
+  }
+
   @override
   void initState() {
     super.initState();
+    _showOwnershipNotice();
     _startLiveSystem();
   }
 
